@@ -1,0 +1,409 @@
+#!/system/bin/sh
+#
+# iQOO 7 宝塔面板管理脚本
+# 用法: btpanel {status|start|stop|restart|install|url}
+#
+
+# 颜色定义
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'
+    NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
+fi
+
+BTPANEL_INSTALL_DIR="/data/btpanel"
+BTPANEL_FLAG_DIR="${BTPANEL_INSTALL_DIR}/.module_flags"
+INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
+INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
+
+# 查找宝塔面板
+find_btpanel() {
+    local paths="
+        /www/server/panel/bt
+        /data/btpanel/bt
+        /data/adb/btpanel/bt
+        /data/btpanel/panel/bt
+        /data/linux/bt
+        /data/linux/www/server/panel/bt
+        /usr/bin/bt
+    "
+    for p in $paths; do
+        if [ -f "$p" ] && [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    local which_bt=$(command -v bt 2>/dev/null)
+    if [ -n "$which_bt" ] && [ -f "$which_bt" ]; then
+        echo "$which_bt"
+        return 0
+    fi
+    return 1
+}
+
+# 获取局域网 IP
+get_local_ip() {
+    local ip=""
+    ip=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+    [ -z "$ip" ] && ip=$(ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+    [ -z "$ip" ] && ip=$(getprop dhcp.wlan0.ipaddress 2>/dev/null)
+    [ -z "$ip" ] && ip=$(ifconfig 2>/dev/null | grep 'inet addr:' | grep -v '127.0.0.1' | head -1 | cut -d: -f2 | awk '{print $1}')
+    [ -z "$ip" ] && ip="N/A"
+    echo "$ip"
+}
+
+# 检查面板运行状态
+check_status() {
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        echo "not_found"
+        return
+    fi
+
+    local pid_file=""
+    for f in /www/server/panel/data/bt.pid /data/btpanel/bt.pid; do
+        if [ -f "$f" ]; then pid_file="$f"; break; fi
+    done
+
+    if [ -n "$pid_file" ]; then
+        local pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "running=$pid"
+            return
+        fi
+    fi
+
+    local status_output=$("$bt_bin" status 2>/dev/null)
+    if echo "$status_output" | grep -iq "running\|started\|active"; then
+        echo "running"
+        return
+    fi
+
+    echo "stopped"
+}
+
+# 下载文件
+download_file() {
+    local url="$1"
+    local output="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSLo "$output" "$url" --connect-timeout 30 --retry 3
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$output" "$url" --timeout=30 --tries=3
+    else
+        return 1
+    fi
+}
+
+# 设置默认账号密码
+setup_default_credentials() {
+    local bt_bin=$(find_btpanel)
+    [ -z "$bt_bin" ] && return 1
+
+    echo -e "${YELLOW}正在设置默认账号密码...${NC}"
+    # bt 5 = 修改密码
+    echo "admin" | "$bt_bin" 5 >/dev/null 2>&1
+    # bt 6 = 修改用户名
+    echo "admin" | "$bt_bin" 6 >/dev/null 2>&1
+    sleep 2
+    echo -e "${GREEN}默认账号: admin  默认密码: admin${NC}"
+}
+
+# 显示状态
+show_status() {
+    echo "========================================="
+    echo "   iQOO 7 宝塔面板状态监控"
+    echo "========================================="
+    echo ""
+
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        if [ -f "$INSTALL_LOCK" ]; then
+            echo -e "  ${YELLOW}⚠ 宝塔面板正在安装中...${NC}"
+            echo ""
+            echo "  安装日志: ${INSTALL_LOG}"
+            echo "  可使用 btpanel log 查看安装进度"
+        elif [ -f "${BTPANEL_FLAG_DIR}/installed" ]; then
+            echo -e "  ${RED}✗ 安装完成但面板文件未找到${NC}"
+            echo "  请尝试: btpanel install"
+        else
+            echo -e "  ${RED}✗ 宝塔面板未安装${NC}"
+            echo ""
+            echo "  模块将在首次开机联网后自动安装"
+            echo "  或手动执行: btpanel install"
+        fi
+        echo ""
+        exit 1
+    fi
+
+    echo -e "  安装路径: ${CYAN}$bt_bin${NC}"
+
+    local status=$(check_status)
+    case "$status" in
+        not_found) echo -e "  运行状态: ${RED}未安装${NC}" ;;
+        stopped)   echo -e "  运行状态: ${RED}已停止${NC}" ;;
+        running=*)
+            local pid=${status#running=}
+            echo -e "  运行状态: ${GREEN}运行中${NC}  (PID: $pid)"
+            ;;
+        running)   echo -e "  运行状态: ${GREEN}运行中${NC}" ;;
+    esac
+
+    local ip=$(get_local_ip)
+    echo -e "  局域网 IP: ${YELLOW}$ip${NC}"
+    echo ""
+    echo "  面板访问地址:"
+    echo -e "    ${GREEN}http://${ip}:8888${NC}"
+    echo ""
+    echo "  默认登录信息:"
+    echo -e "    账号: ${YELLOW}admin${NC}"
+    echo -e "    密码: ${YELLOW}admin${NC}"
+    echo ""
+    echo "  管理命令:"
+    echo "    btpanel status   查看状态"
+    echo "    btpanel start    启动面板"
+    echo "    btpanel stop     停止面板"
+    echo "    btpanel restart  重启面板"
+    echo "    btpanel install  安装/重装面板"
+    echo "    btpanel url      显示访问地址"
+    echo "    btpanel log      查看安装日志"
+    echo "========================================="
+}
+
+# 启动面板
+start_panel() {
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        echo -e "${RED}错误: 未找到宝塔面板${NC}"
+        echo "请先执行: btpanel install"
+        exit 1
+    fi
+
+    local status=$(check_status)
+    if echo "$status" | grep -q "^running"; then
+        echo -e "${GREEN}宝塔面板已在运行中${NC}"
+        return 0
+    fi
+
+    echo -n "正在启动宝塔面板..."
+    export BT_IGNORE=1
+    nohup "$bt_bin" start >/dev/null 2>&1 &
+    sleep 3
+
+    local new_status=$(check_status)
+    if echo "$new_status" | grep -q "^running"; then
+        echo -e " ${GREEN}成功${NC}"
+        local ip=$(get_local_ip)
+        echo "面板地址: http://${ip}:8888"
+    else
+        echo -e " ${RED}失败${NC}"
+        echo "请检查面板安装是否正确: btpanel log"
+    fi
+}
+
+# 停止面板
+stop_panel() {
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        echo -e "${RED}错误: 未找到宝塔面板${NC}"
+        exit 1
+    fi
+
+    echo -n "正在停止宝塔面板..."
+    "$bt_bin" stop >/dev/null 2>&1
+    sleep 2
+    echo -e " ${GREEN}已停止${NC}"
+}
+
+# 重启面板
+restart_panel() {
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        echo -e "${RED}错误: 未找到宝塔面板${NC}"
+        exit 1
+    fi
+
+    echo -n "正在重启宝塔面板..."
+    export BT_IGNORE=1
+    "$bt_bin" restart >/dev/null 2>&1
+    sleep 3
+
+    local new_status=$(check_status)
+    if echo "$new_status" | grep -q "^running"; then
+        echo -e " ${GREEN}成功${NC}"
+        local ip=$(get_local_ip)
+        echo "面板地址: http://${ip}:8888"
+    else
+        echo -e " ${RED}失败${NC}"
+    fi
+}
+
+# 安装宝塔面板
+install_panel() {
+    # 检查是否已安装
+    if find_btpanel >/dev/null 2>&1; then
+        echo -e "${YELLOW}宝塔面板已安装，是否重新安装？${NC}"
+        echo -n "确认重装? (y/N): "
+        read -r confirm
+        case "$confirm" in
+            y|Y) echo -e "开始重装..." ;;
+            *) echo -e "已取消"; exit 0 ;;
+        esac
+    fi
+
+    # 检查基础工具
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        echo -e "${RED}错误: 未找到 curl 或 wget${NC}"
+        echo "请安装 curl 或 wget"
+        exit 1
+    fi
+
+    # 检查网络
+    echo -e "${YELLOW}检查网络连接...${NC}"
+    if ! ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1; then
+        echo -e "${RED}警告: 网络似乎不通，安装可能失败${NC}"
+    fi
+
+    # 创建目录
+    mkdir -p "${BTPANEL_FLAG_DIR}"
+    mkdir -p /www
+
+    # 下载安装脚本
+    echo -e "${YELLOW}正在下载宝塔面板安装脚本...${NC}"
+    local install_script="/tmp/bt_install_panel.sh"
+    if ! download_file "https://download.bt.cn/install/install_panel.sh" "$install_script"; then
+        echo -e "${RED}下载安装脚本失败${NC}"
+        echo "请检查网络连接后重试"
+        exit 1
+    fi
+    chmod 0755 "$install_script"
+
+    echo -e "${YELLOW}开始安装宝塔面板（此过程可能需要 3-10 分钟）...${NC}"
+    echo -e "${YELLOW}安装日志: ${INSTALL_LOG}${NC}"
+    echo ""
+
+    # 后台执行安装
+    {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 手动安装开始..."
+        echo "y" | bash "$install_script" ed8484bec
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装脚本执行完毕"
+    } >> "${INSTALL_LOG}" 2>&1 &
+
+    local install_pid=$!
+    echo -e "安装进程 PID: ${CYAN}$install_pid${NC}"
+
+    # 等待安装完成
+    local timeout=600
+    local elapsed=0
+    while kill -0 "$install_pid" 2>/dev/null; do
+        sleep 10
+        elapsed=$((elapsed + 10))
+        echo -n "."
+        if [ $elapsed -ge $timeout ]; then
+            echo ""
+            echo -e "${RED}安装超时，请检查日志: btpanel log${NC}"
+            break
+        fi
+    done
+    echo ""
+
+    # 检查结果
+    if find_btpanel >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ 宝塔面板安装成功！${NC}"
+        setup_default_credentials
+        touch "${BTPANEL_FLAG_DIR}/installed"
+
+        # 启动面板
+        export BT_IGNORE=1
+        local bt_bin=$(find_btpanel)
+        nohup "$bt_bin" start >/dev/null 2>&1 &
+        sleep 2
+
+        local ip=$(get_local_ip)
+        echo ""
+        echo "  面板访问地址: ${GREEN}http://${ip}:8888${NC}"
+        echo "  账号: admin"
+        echo "  密码: admin"
+    else
+        echo -e "${RED}❌ 安装失败${NC}"
+        echo "请查看日志: btpanel log"
+        echo "或手动安装: https://www.bt.cn/new/download.html"
+    fi
+}
+
+# 显示访问地址
+show_url() {
+    local bt_bin=$(find_btpanel)
+    if [ -z "$bt_bin" ]; then
+        echo -e "${RED}错误: 未找到宝塔面板${NC}"
+        exit 1
+    fi
+
+    local ip=$(get_local_ip)
+    local status=$(check_status)
+    local status_text=""
+    if echo "$status" | grep -q "^running"; then
+        status_text="${GREEN}[运行中]${NC}"
+    else
+        status_text="${RED}[已停止]${NC}"
+    fi
+
+    echo "宝塔面板 $status_text"
+    echo "访问地址: http://${ip}:8888"
+    echo "账号: admin / 密码: admin"
+}
+
+# 查看安装日志
+show_log() {
+    if [ -f "$INSTALL_LOG" ]; then
+        if [ -t 1 ]; then
+            less "$INSTALL_LOG"
+        else
+            cat "$INSTALL_LOG"
+        fi
+    else
+        echo "暂无安装日志"
+    fi
+}
+
+# ========== 主入口 ==========
+case "${1:-status}" in
+    status)
+        show_status
+        ;;
+    start)
+        start_panel
+        ;;
+    stop)
+        stop_panel
+        ;;
+    restart)
+        restart_panel
+        ;;
+    install)
+        install_panel
+        ;;
+    url)
+        show_url
+        ;;
+    log)
+        show_log
+        ;;
+    *)
+        echo "用法: btpanel {status|start|stop|restart|install|url|log}"
+        echo "  status   查看运行状态和访问信息"
+        echo "  start    启动宝塔面板"
+        echo "  stop     停止宝塔面板"
+        echo "  restart  重启宝塔面板"
+        echo "  install  安装/重装宝塔面板"
+        echo "  url      显示面板访问地址"
+        echo "  log      查看安装日志"
+        exit 1
+        ;;
+esac
+
+exit 0
