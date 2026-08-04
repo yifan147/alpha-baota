@@ -8,6 +8,7 @@ MODDIR=${0%/*}
 BTPANEL_BIN=""
 BTPANEL_INSTALL_DIR="/data/btpanel"
 BTPANEL_FLAG_DIR="${BTPANEL_INSTALL_DIR}/.module_flags"
+BTPANEL_STATE_FILE="${BTPANEL_FLAG_DIR}/state"
 INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
 INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
 
@@ -251,9 +252,70 @@ start_btpanel() {
         fi
     fi
 
+    # 写入状态：启动中
+    mkdir -p "${BTPANEL_FLAG_DIR}"
+    echo "starting" > "${BTPANEL_STATE_FILE}"
+
     # 启动面板
     export BT_IGNORE=1
     nohup "$bt_bin" start >/dev/null 2>&1 &
+
+    # 等待启动完成（最多 30 秒），成功后状态改回空（由检测自动显示运行中）
+    (
+        local waited=0
+        while [ $waited -lt 30 ]; do
+            sleep 3
+            waited=$((waited + 3))
+            local started=0
+            for f in /www/server/panel/data/bt.pid /data/btpanel/bt.pid; do
+                if [ -f "$f" ]; then
+                    local p=$(cat "$f" 2>/dev/null)
+                    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then started=1; break; fi
+                fi
+            done
+            if [ $started -eq 1 ]; then break; fi
+        done
+        rm -f "${BTPANEL_STATE_FILE}"
+        update_module_desc
+    ) &
+    return 0
+}
+
+# 停止宝塔面板（供 action.sh / btpanel 命令共享调用）
+stop_btpanel() {
+    local bt_bin="$1"
+    if [ -z "$bt_bin" ]; then bt_bin=$(find_btpanel); fi
+    if [ -z "$bt_bin" ]; then return 1; fi
+
+    # 写入状态：停止中
+    mkdir -p "${BTPANEL_FLAG_DIR}"
+    echo "stopping" > "${BTPANEL_STATE_FILE}"
+
+    export BT_IGNORE=1
+    "$bt_bin" stop >/dev/null 2>&1
+
+    # 等进程真正退出（最多 20 秒）
+    (
+        local waited=0
+        while [ $waited -lt 20 ]; do
+            sleep 2
+            waited=$((waited + 2))
+            local running=0
+            for f in /www/server/panel/data/bt.pid /data/btpanel/bt.pid; do
+                if [ -f "$f" ]; then
+                    local p=$(cat "$f" 2>/dev/null)
+                    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then running=1; break; fi
+                fi
+            done
+            pgrep -f "BT-Panel" >/dev/null 2>&1 && running=1
+            if [ $running -eq 0 ]; then break; fi
+        done
+        # 兜底：强制杀残留
+        pkill -f "BT-Panel" >/dev/null 2>&1 || true
+        pkill -f "gunicorn.*panel" >/dev/null 2>&1 || true
+        rm -f "${BTPANEL_STATE_FILE}"
+        update_module_desc
+    ) &
     return 0
 }
 
@@ -270,9 +332,17 @@ update_module_desc() {
     [ -z "$ip" ] && ip=$(getprop dhcp.wlan0.ipaddress 2>/dev/null)
     [ -z "$ip" ] && ip="无法获取"
 
-    # 检查面板状态
+    # ===== 1. 先读取过渡状态文件（优先级最高）=====
+    local trans_state=""
+    if [ -f "$BTPANEL_STATE_FILE" ]; then
+        trans_state=$(cat "$BTPANEL_STATE_FILE" 2>/dev/null)
+    fi
+
+    # ===== 2. 再判断安装 + 运行状态 =====
     local status="未安装"
+    local status_icon="✘"
     local bt_bin=$(find_btpanel)
+
     if [ -n "$bt_bin" ]; then
         local pid_file=""
         for f in /www/server/panel/data/bt.pid /data/btpanel/bt.pid; do
@@ -282,25 +352,44 @@ update_module_desc() {
             local pid=$(cat "$pid_file" 2>/dev/null)
             if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                 status="运行中"
+                status_icon="✔"
             else
                 status="已停止"
+                status_icon="✘"
             fi
         else
-            status="已安装"
+            # 有 bt 但无 pid 文件：已安装但没启动
+            status="已停止"
+            status_icon="✘"
         fi
     elif [ -f "${BTPANEL_FLAG_DIR}/installed" ]; then
         status="安装完成"
+        status_icon="●"
     elif [ -f "$INSTALL_LOCK" ]; then
         status="安装中..."
+        status_icon="↓"
     fi
 
-    # 更新描述
+    # ===== 3. 过渡状态覆盖最终状态 =====
+    case "$trans_state" in
+        starting) status="启动中..."; status_icon="→" ;;
+        stopping) status="停止中..."; status_icon="×" ;;
+    esac
+
+    # ===== 4. 拼装描述（模仿 Openlist_online：前一行带状态图标+IP+账号）=====
+    local extra_line=""
+    if [ "$status" = "运行中" ] || [ "$status" = "启动中..." ]; then
+        extra_line="访问 http://${ip}:8888 账号admin/admin"
+    else
+        extra_line="访问 http://${ip}:8888 账号admin/admin"
+    fi
+
     local new_desc="iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块
-├ 状态: $status
-├ 访问地址: http://${ip}:8888
-├ 默认账号: admin
-├ 默认密码: admin
-└ 管理命令: btpanel status"
+首次安装自动检测宝塔：已装跳过/残留清理/未装联网安装
+| ${status_icon} 状态: ${status}
+| ${extra_line}
+| 默认账号: admin  密码: admin
+└ 管理: btpanel status   操作: 点右下按钮 音量±菜单"
 
     if [ -f "$module_prop" ]; then
         sed -i "/^description=/c\description=$new_desc" "$module_prop" 2>/dev/null

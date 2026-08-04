@@ -1,6 +1,6 @@
 id=btpanel_iqoo7
 name=iQOO 7 宝塔面板自动安装+开机自启
-version=v2.2.0
-versionCode=4
+version=v2.3.0
+versionCode=5
 author=iQOO7_Modder
-description=iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块。首次安装时自动检测宝塔是否已存在：已安装则直接启动，存在残留目录则自动清理，无安装则联网自动安装。默认账号密码均为 admin。支持面板状态监控与局域网 IP 地址动态显示。
+description=iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块。首次安装智能预检：已装跳过/残留清理/未装联网安装。模块介绍动态显示状态（启动中/运行中/停止中/已停止）。点操作按钮音量±菜单：开启/关闭/重启宝塔。默认账号密码 admin。
