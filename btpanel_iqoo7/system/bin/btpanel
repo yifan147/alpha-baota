@@ -45,6 +45,34 @@ find_btpanel() {
     return 1
 }
 
+# 检查是否有宝塔面板残留（安装中断留下来的残缺目录）
+has_btpanel_residue() {
+    if [ -d "/www/server/panel" ]; then
+        if [ ! -f "/www/server/panel/class/panelPlugin.py" ] || [ ! -x "/www/server/panel/bt" ]; then
+            return 0
+        fi
+    fi
+    if [ -d "${BTPANEL_INSTALL_DIR}/panel" ]; then
+        if [ ! -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ] || [ ! -x "${BTPANEL_INSTALL_DIR}/bt" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 检查面板是否已「完整」安装（有 bt 命令 + 有核心 class）
+is_btpanel_installed() {
+    local bt_bin=$(find_btpanel)
+    local core_ok=0
+    if [ -d "/www/server/panel" ] && [ -f "/www/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
+    if [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ]; then core_ok=1; fi
+    if [ -d "/data/adb/btpanel/panel" ] && [ -f "/data/adb/btpanel/panel/class/panelPlugin.py" ]; then core_ok=1; fi
+    if [ -d "/data/linux/www/server/panel" ] && [ -f "/data/linux/www/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
+    if [ -n "$bt_bin" ] && [ $core_ok -eq 1 ]; then return 0; fi
+    [ -n "$bt_bin" ] && return 0
+    return 1
+}
+
 # 获取局域网 IP
 get_local_ip() {
     local ip=""
@@ -244,15 +272,48 @@ restart_panel() {
 
 # 安装宝塔面板
 install_panel() {
-    # 检查是否已安装
-    if find_btpanel >/dev/null 2>&1; then
+    # 情况 1：完整安装存在 → 提示重装（需要交互确认）
+    if is_btpanel_installed; then
+        local bt=$(find_btpanel)
+        echo -e "${GREEN}✔ 检测到已安装的宝塔面板${NC}"
+        echo -e "  路径: ${CYAN}$bt${NC}"
+        echo -e "  状态: 已完整安装，若要重装请在下方确认"
+        echo ""
         echo -e "${YELLOW}宝塔面板已安装，是否重新安装？${NC}"
+        echo "  重装将会覆盖现有安装，但不会卸载已配置的站点/数据库"
         echo -n "确认重装? (y/N): "
         read -r confirm
         case "$confirm" in
             y|Y) echo -e "开始重装..." ;;
-            *) echo -e "已取消"; exit 0 ;;
+            *)   echo -e "已取消，退出。执行 btpanel start 启动现有面板。"; exit 0 ;;
         esac
+    fi
+
+    # 情况 2：残留目录 → 自动清理（不需要确认）
+    if has_btpanel_residue; then
+        echo -e "${YELLOW}⚠ 检测到宝塔面板残留目录，自动清理中...${NC}"
+        for p in /www/server/panel/bt "${BTPANEL_INSTALL_DIR}/bt"; do
+            if [ -x "$p" ]; then "$p" stop >/dev/null 2>&1; fi
+        done
+        pkill -f "BT-Panel" >/dev/null 2>&1 || true
+        pkill -f "gunicorn.*panel" >/dev/null 2>&1 || true
+        rm -f "${INSTALL_LOCK}" "${BTPANEL_FLAG_DIR}/installed"
+        if [ -d "/www/server/panel" ] && [ ! -f "/www/server/panel/class/panelPlugin.py" ]; then
+            rm -rf /www/server/panel 2>/dev/null || true
+        fi
+        echo -e "${GREEN}✔ 残留目录已清理${NC}"
+    fi
+
+    # 检查是否已有 install.sh 进程在运行（避免两个安装进程冲突）
+    if [ -f "${INSTALL_LOCK}" ]; then
+        local lockpid=$(cat "${INSTALL_LOCK}" 2>/dev/null)
+        if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then
+            echo -e "${YELLOW}⚠ 检测到已在运行的安装进程 (PID: $lockpid)${NC}"
+            echo "  请等待安装完成，或使用: btpanel log 查看进度"
+            exit 1
+        else
+            rm -f "${INSTALL_LOCK}"
+        fi
     fi
 
     # 检查基础工具
@@ -286,11 +347,13 @@ install_panel() {
     echo -e "${YELLOW}安装日志: ${INSTALL_LOG}${NC}"
     echo ""
 
-    # 后台执行安装
+    # 后台执行安装 + 加锁
+    echo "$$" > "${INSTALL_LOCK}"
     {
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 手动安装开始..."
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 手动安装开始（由 btpanel install 触发）..."
         echo "y" | bash "$install_script" ed8484bec
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装脚本执行完毕"
+        rm -f "${INSTALL_LOCK}"
     } >> "${INSTALL_LOG}" 2>&1 &
 
     local install_pid=$!
@@ -312,7 +375,7 @@ install_panel() {
     echo ""
 
     # 检查结果
-    if find_btpanel >/dev/null 2>&1; then
+    if is_btpanel_installed; then
         echo -e "${GREEN}✅ 宝塔面板安装成功！${NC}"
         setup_default_credentials
         touch "${BTPANEL_FLAG_DIR}/installed"
