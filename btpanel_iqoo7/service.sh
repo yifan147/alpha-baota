@@ -23,11 +23,20 @@ wait_for_boot_complete() {
     sleep 5
 }
 
-# 等待网络就绪
+# 等待网络就绪（ping 可能被 SELinux 禁止，多重检测）
 wait_for_network() {
     local timeout=120
     local elapsed=0
-    while ! ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; do
+    while true; do
+        # 方法 1: ping 探测
+        if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then break; fi
+        # 方法 2: 检查 getprop 网络状态
+        [ "$(getprop net.dns1 2>/dev/null)" != "" ] && break
+        [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && break
+        # 方法 3: 检查路由表有无默认路由
+        if [ -f /proc/net/route ]; then
+            if grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null; then break; fi
+        fi
         sleep 5
         elapsed=$((elapsed + 5))
         if [ $elapsed -ge $timeout ]; then break; fi
@@ -92,6 +101,9 @@ cleanup_btpanel_residue() {
     if [ -d "/www/server/panel" ] && [ ! -f "/www/server/panel/class/panelPlugin.py" ]; then
         rm -rf /www/server/panel 2>/dev/null || true
     fi
+    if [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ ! -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ]; then
+        rm -rf "${BTPANEL_INSTALL_DIR}/panel" 2>/dev/null || true
+    fi
 }
 
 # 检查面板是否已完整安装
@@ -116,8 +128,6 @@ is_btpanel_installed() {
     if [ -n "$bt_bin" ] && [ $panel_ok -eq 1 ]; then
         return 0
     fi
-    # 兼容传统检测：仅有 bt 且可执行也视作已装
-    [ -n "$bt_bin" ] && return 0
 
     return 1
 }
@@ -156,6 +166,14 @@ auto_install_btpanel() {
 
     # 创建安装锁，防止重复安装
     echo "$$" > "$INSTALL_LOCK"
+
+    # 日志轮转：超过 512KB 时只保留最后 1000 行
+    if [ -f "$INSTALL_LOG" ]; then
+        local log_size=$(wc -c < "$INSTALL_LOG" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 524288 ]; then
+            tail -n 1000 "$INSTALL_LOG" > "${INSTALL_LOG}.tmp" 2>/dev/null && mv "${INSTALL_LOG}.tmp" "$INSTALL_LOG"
+        fi
+    fi
 
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始自动安装宝塔面板..."

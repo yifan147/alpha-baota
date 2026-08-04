@@ -85,8 +85,5 @@ ui_print "  • 终端执行: btpanel install 手动重装"
 ui_print "  • 安装日志: /data/btpanel/install.log"
 ui_print ""
 
-# 创建标志文件
-touch $MODPATH/installed
-
 # 确保标志目录提前创建（首次启动无额外延时）
 mkdir -p /data/btpanel/.module_flags 2>/dev/null || true

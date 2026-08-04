@@ -69,7 +69,6 @@ is_btpanel_installed() {
     if [ -d "/data/adb/btpanel/panel" ] && [ -f "/data/adb/btpanel/panel/class/panelPlugin.py" ]; then core_ok=1; fi
     if [ -d "/data/linux/www/server/panel" ] && [ -f "/data/linux/www/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
     if [ -n "$bt_bin" ] && [ $core_ok -eq 1 ]; then return 0; fi
-    [ -n "$bt_bin" ] && return 0
     return 1
 }
 
@@ -301,6 +300,9 @@ install_panel() {
         if [ -d "/www/server/panel" ] && [ ! -f "/www/server/panel/class/panelPlugin.py" ]; then
             rm -rf /www/server/panel 2>/dev/null || true
         fi
+        if [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ ! -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ]; then
+            rm -rf "${BTPANEL_INSTALL_DIR}/panel" 2>/dev/null || true
+        fi
         echo -e "${GREEN}✔ 残留目录已清理${NC}"
     fi
 
@@ -332,6 +334,14 @@ install_panel() {
     # 创建目录
     mkdir -p "${BTPANEL_FLAG_DIR}"
     mkdir -p /www
+
+    # 日志轮转：超过 512KB 时只保留最后 1000 行
+    if [ -f "$INSTALL_LOG" ]; then
+        local log_size=$(wc -c < "$INSTALL_LOG" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 524288 ]; then
+            tail -n 1000 "$INSTALL_LOG" > "${INSTALL_LOG}.tmp" 2>/dev/null && mv "${INSTALL_LOG}.tmp" "$INSTALL_LOG"
+        fi
+    fi
 
     # 下载安装脚本
     echo -e "${YELLOW}正在下载宝塔面板安装脚本...${NC}"
