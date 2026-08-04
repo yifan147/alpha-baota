@@ -19,6 +19,16 @@ BTPANEL_INSTALL_DIR="/data/btpanel"
 BTPANEL_FLAG_DIR="${BTPANEL_INSTALL_DIR}/.module_flags"
 INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
 INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
+# SH 解释器探测：Android 环境通常没有 bash
+if command -v bash >/dev/null 2>&1; then
+    SH_BIN=$(command -v bash)
+elif command -v sh >/dev/null 2>&1; then
+    SH_BIN=$(command -v sh)
+elif [ -x /system/bin/sh ]; then
+    SH_BIN=/system/bin/sh
+else
+    SH_BIN=/bin/sh
+fi
 
 # 查找宝塔面板
 find_btpanel() {
@@ -409,7 +419,7 @@ install_panel() {
     echo "$$" > "${INSTALL_LOCK}"
     {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 手动安装开始（由 btpanel install 触发）..."
-        echo "y" | bash "$install_script" ed8484bec
+        echo "y" | "$SH_BIN" "$install_script" ed8484bec
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装脚本执行完毕"
         rm -f "${INSTALL_LOCK}"
     } >> "${INSTALL_LOG}" 2>&1 &

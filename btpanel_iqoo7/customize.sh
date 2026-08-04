@@ -202,120 +202,49 @@ elif [ $found_residue -eq 1 ]; then
     rm -f "${BTPANEL_FLAG_DIR}/installed" "${BTPANEL_FLAG_DIR}/install.lock"
 fi
 
-# ========== 核心：刷入阶段直接自动安装（有网就装，超时写续装标志让开机续装）==========
+# ========== 核心：只写续装标志，安装统一放到开机 service.sh 阶段 ==========
+# 原因：刷入环境（recovery/update-binary）缺少 bash、curl 写入路径受限、且用户反馈「有网络直接秒失败」
+# 统一由开机后 service.sh 联网下载安装 → 更稳定、可观察进度、动态显示安装状态
 if ! is_btpanel_installed; then
+    # 不管有没有网络都写 force_continue_install 标志，service.sh 开机后优先检测
+    echo "1" > "$FORCE_CONTINUE_FLAG"
+
     ui_print ""
     if network_ok; then
-        ui_print "  ↓ 检测到网络，刷入阶段立即安装宝塔面板..."
-        ui_print "    （最多等待 480 秒，装不完会在重启后继续）"
-        logi "刷入阶段检测到网络，立即开始安装宝塔面板"
-
-        # 写续装标志（一旦开始安装就先写，成功再清，失败或超时也留着让 service.sh 兜底）
-        echo "1" > "$FORCE_CONTINUE_FLAG"
-
-        {
-            echo ""
-            echo "========== 刷入阶段安装开始 $(date '+%Y-%m-%d %H:%M:%S') =========="
-        } >> "$INSTALL_LOG" 2>&1
-
-        install_script="/data/local/tmp/bt_install_panel.sh"
-        if download_file "https://download.bt.cn/install/install_panel.sh" "$install_script"; then
-            chmod 0755 "$install_script"
-
-            # ===== 关键：处理 /www 只读问题 =====
-            if ensure_www_writable; then
-                ui_print "  ✔ /www 可写，使用标准路径安装"
-                logi "/www 可写，标准路径安装"
-            else
-                ui_print "  ⚠ /www 只读，fallback 到 /data/btpanel 安装"
-                logi "/www 不可写，patch 安装脚本使用 /data/btpanel 路径"
-                patch_install_script_for_data "$install_script"
-            fi
-
-            # 在后台开始安装，前台最多等 480 秒（8 分钟）
-            # 注意：此处在 () 子 shell 中运行，不能用 local 关键字
-            (
-                echo "y" | bash "$install_script" ed8484bec
-                rc=$?
-                echo "========== 安装脚本结束 rc=$rc $(date '+%Y-%m-%d %H:%M:%S') =========="
-                if is_btpanel_installed; then
-                    echo "[OK] 刷入阶段安装完成"
-                    setup_default_credentials
-                    touch "${BTPANEL_FLAG_DIR}/installed"
-                    rm -f "$FORCE_CONTINUE_FLAG"
-                    # 顺手启动一次（如果刷入环境允许）
-                    b2=$(find_btpanel)
-                    if [ -n "$b2" ]; then
-                        export BT_IGNORE=1
-                        nohup "$b2" start >/dev/null 2>&1 &
-                    fi
-                    echo "[OK] 刷入阶段全部流程结束 rc=0"
-                else
-                    echo "[WARN] 刷入阶段未完成，将在重启后继续（force_continue_install 已写）"
-                    echo "1" > "$FORCE_CONTINUE_FLAG"
-                fi
-                exit 0
-            ) >> "$INSTALL_LOG" 2>&1 &
-
-            install_pid=$!
-            waited=0
-            # 前台等最多 480 秒
-            while [ $waited -lt 480 ]; do
-                kill -0 "$install_pid" 2>/dev/null || break
-                sleep 5
-                waited=$((waited + 5))
-                # 每 30 秒输出一条进度提示，防止 Magisk UI 假死
-                if [ $((waited % 30)) -eq 0 ]; then
-                    ui_print "    安装中... 已等待 ${waited}s（装不完重启继续）"
-                fi
-            done
-
-            if is_btpanel_installed; then
-                ui_print ""
-                ui_print "  ✅ 宝塔面板已安装完成！"
-                ui_print "    默认账号: admin  密码: admin"
-                logi "刷入阶段已成功安装宝塔面板"
-                rm -f "$FORCE_CONTINUE_FLAG"
-            else
-                # 没装完 → 标志续装（前面已写，这里确认一遍）
-                echo "1" > "$FORCE_CONTINUE_FLAG"
-                ui_print ""
-                ui_print "  ⚠ 安装未在 480s 内完成，已写续装标志"
-                ui_print "    重启设备后 service.sh 会立刻继续安装（联网环境）"
-                loge "customize.sh 安装未完成，设 force_continue_install 标志"
-            fi
-        else
-            loge "下载 install_panel.sh 失败"
-            ui_print "  ❌ 下载安装脚本失败，已写续装标志"
-            ui_print "    重启后 service.sh 会重试"
-        fi
+        ui_print "  ✅ 检测到网络"
     else
-        # 没网 → 写续装标志，service.sh 一开机就强制续装
-        echo "1" > "$FORCE_CONTINUE_FLAG"
-        ui_print "  ⚠ 刷入环境无网络，无法立即安装"
-        ui_print "    已写续装标志，重启联网后 service.sh 会立刻安装"
-        logi "刷入环境无网络，设 force_continue_install 标志，等待开机续装"
+        ui_print "  ⚠ 暂无网络"
     fi
+    ui_print "  ↓ 将在重启后自动联网安装宝塔面板"
+    ui_print "    （service.sh 阶段自动执行，可在介绍中实时查看安装状态）"
+    logi "刷入阶段：不直接安装，已写 force_continue_install → service.sh 开机后自动装"
+
+    ui_print ""
+    ui_print "  安装进度查看方式:"
+    ui_print "  ├ 模块介绍: 动态显示「安装中 ↓ / 安装失败 ✗ / 已启动 ▶ / 已关闭 ■」"
+    ui_print "  └ 查看日志: btpanel log 或 tail -f /data/btpanel/install.log"
+else
+    # 已经完整安装过 → 保险清标志
+    rm -f "$FORCE_CONTINUE_FLAG"
 fi
 
-# 失败日志保护：如果检测到有 install.lock 或 force_continue 都算异常现场
-if [ -f "${BTPANEL_FLAG_DIR}/install.lock" ] || [ -f "$FORCE_CONTINUE_FLAG" ]; then
+# 失败日志保护：保留 install.log 存档
+if [ -f "$INSTALL_LOG" ]; then
     cp -f "$INSTALL_LOG" "${BTPANEL_FLAG_DIR}/install.latest.log" 2>/dev/null || true
 fi
 
 ui_print ""
 ui_print "  功能说明:"
-ui_print "  ├ 刷入后若网络可用会直接开始联网安装宝塔（最多等 8 分钟）"
-ui_print "  ├ 装不完/没网 → 重启后 service.sh 立刻续装"
+ui_print "  ├ 重启后 service.sh 自动联网安装宝塔（检测到网络立即开始）"
 ui_print "  ├ 安装完成后自动启动面板服务，后续每次开机自启"
 ui_print "  ├ 面板默认账号: admin   密码: admin"
-ui_print "  ├ 介绍: 动态显示【已启动/已关闭】两种最终状态"
+ui_print "  ├ 介绍: 动态显示【安装中 ↓ / 安装失败 ✗ / 已启动 ▶ / 已关闭 ■】"
 ui_print "  └ 操作: 点右下按钮 → 音量上=开启 音量下=关闭"
 ui_print ""
 ui_print "  日志位置:"
 ui_print "  • 安装日志: /data/btpanel/install.log"
 ui_print "  • 失败日志: /data/btpanel/crash.log"
-ui_print "  • 命令调试: btpanel status / start / stop / restart"
+ui_print "  • 命令调试: btpanel status / start / stop / restart / log"
 ui_print ""
 
 # 确保标志目录存在 + 权限可写

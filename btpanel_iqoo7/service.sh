@@ -13,8 +13,19 @@ BTPANEL_STATE_FILE="${BTPANEL_FLAG_DIR}/state"
 INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
 INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
 CRASH_LOG="${BTPANEL_INSTALL_DIR}/crash.log"
+INSTALL_FAILED_LOG="${BTPANEL_FLAG_DIR}/install.failed.log"
 # customize.sh 刷入阶段没装完 → service.sh 开机立刻强制续装
 FORCE_CONTINUE_FLAG="${BTPANEL_FLAG_DIR}/force_continue_install"
+# SH 解释器探测：Android recovery / Magisk 环境经常没有 bash，必须兼容 sh
+if command -v bash >/dev/null 2>&1; then
+    SH_BIN=$(command -v bash)
+elif command -v sh >/dev/null 2>&1; then
+    SH_BIN=$(command -v sh)
+elif [ -x /system/bin/sh ]; then
+    SH_BIN=/system/bin/sh
+else
+    SH_BIN=/bin/sh
+fi
 # 模块多路径兼容（Magisk 原版 / Alpha / Delta / Kitsune）
 # 注意：busybox ash 不支持数组 → 用空格分隔字符串，路径无空格安全
 MODULE_PATHS="/data/adb/modules/btpanel_iqoo7 /data/adb/modules_update/btpanel_iqoo7 /data/alcatel/modules/btpanel_iqoo7 /data/local/tmp/magisk_btpanel_iqoo7"
@@ -243,10 +254,10 @@ auto_install_btpanel() {
         fi
 
         echo "执行安装（3-10 分钟）..."
-        # 捕获 bash 安装子过程退出码
-        set -o pipefail 2>/dev/null || true
-        echo "y" | bash "$install_script" ed8484bec 2>&1 | tee -a "${INSTALL_LOG}"
-        local rc=${PIPESTATUS[1]:-$?}
+        # 注意：本块已经 { ... } >> "$INSTALL_LOG" 2>&1 重定向，不需要 tee
+        # 用 SH_BIN（可能是 bash 也可能是 sh）执行脚本，不用 PIPESTATUS
+        echo "y" | "$SH_BIN" "$install_script" ed8484bec
+        local rc=$?
         echo "安装脚本退出码: $rc"
 
         if is_btpanel_installed; then
@@ -370,17 +381,21 @@ update_module_desc() {
     pgrep -f "BT-Panel" >/dev/null 2>&1 && running=1
     pgrep -f "gunicorn.*panel" >/dev/null 2>&1 && running=1
 
+    # 状态优先级：安装中 ↓ > 安装失败 ✗ > 已启动 ▶ > 已关闭 ■
     local status="" icon=""
-    if [ $running -eq 1 ]; then
+    if [ -f "$INSTALL_LOCK" ] || [ -f "$FORCE_CONTINUE_FLAG" ]; then
+        # INSTALL_LOCK 存在 = 正在安装；FORCE_CONTINUE 存在 = 等待安装
+        status="安装中 ↓"; icon="↓"
+    elif ! is_btpanel_installed && [ -f "$INSTALL_FAILED_LOG" ]; then
+        # 未安装 + 失败日志存在 = 安装失败
+        status="安装失败 ✗"; icon="✗"
+    elif [ $running -eq 1 ]; then
         status="已启动"; icon="▶"
     elif [ $installed -eq 1 ] || [ -f "${BTPANEL_FLAG_DIR}/installed" ]; then
         status="已关闭"; icon="■"
-    elif [ -f "$INSTALL_LOCK" ] || [ -f "$FORCE_CONTINUE_FLAG" ]; then
-        # 安装中阶段也统一显示为「已关闭」，保持 UI 不跳，真实进度看 install.log
-        status="已关闭"; icon="■"
     else
-        # 未安装也显示为「已关闭」风格，避免 UI 显示第三态引发迷惑
-        status="已关闭"; icon="■"
+        # 没装过也没失败过 = 等待安装中
+        status="安装中 ↓"; icon="↓"
     fi
 
     local new_desc="iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块
