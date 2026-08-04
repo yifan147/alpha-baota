@@ -90,9 +90,9 @@ wait_for_network() {
 
 find_btpanel() {
     local p
-    for p in /www/server/panel/bt /data/btpanel/bt /data/adb/btpanel/bt \
-             /data/btpanel/panel/bt /data/linux/bt /data/linux/www/server/panel/bt \
-             /usr/bin/bt; do
+    for p in /www/server/panel/bt /data/btpanel/bt /data/btpanel/server/panel/bt \
+             /data/adb/btpanel/bt /data/btpanel/panel/bt /data/linux/bt \
+             /data/linux/www/server/panel/bt /usr/bin/bt; do
         [ -f "$p" ] && [ -x "$p" ] && echo "$p" && return 0
     done
     local which_bt=$(command -v bt 2>/dev/null)
@@ -134,8 +134,8 @@ is_btpanel_installed() {
     local bt_bin=$(find_btpanel)
     local core_ok=0
     local d
-    for d in /www/server/panel "${BTPANEL_INSTALL_DIR}/panel" /data/adb/btpanel/panel \
-             /data/linux/www/server/panel; do
+    for d in /www/server/panel /data/btpanel/server/panel "${BTPANEL_INSTALL_DIR}/panel" \
+             /data/adb/btpanel/panel /data/linux/www/server/panel; do
         [ -d "$d" ] && [ -f "$d/class/panelPlugin.py" ] && core_ok=1 && break
     done
     [ -n "$bt_bin" ] && [ $core_ok -eq 1 ] && return 0
@@ -144,6 +144,10 @@ is_btpanel_installed() {
 
 download_file() {
     local url="$1" out="$2"
+    # Android /tmp 通常不存在 → 用 /data/local/tmp
+    local out_dir
+    out_dir=$(dirname "$out" 2>/dev/null)
+    [ -n "$out_dir" ] && mkdir -p "$out_dir" 2>/dev/null
     if command -v curl >/dev/null 2>&1; then
         curl -sSLo "$out" "$url" --connect-timeout 30 --retry 3
     elif command -v wget >/dev/null 2>&1; then
@@ -151,6 +155,40 @@ download_file() {
     else
         return 1
     fi
+}
+
+# ========== /www 只读文件系统兼容 ==========
+ensure_www_writable() {
+    if [ -d /www ] && [ -w /www ]; then return 0; fi
+    mkdir -p /www 2>/dev/null
+    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
+        rm -f /www/.write_test; return 0
+    fi
+    mount -o remount,rw / 2>/dev/null
+    mkdir -p /www 2>/dev/null
+    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
+        rm -f /www/.write_test; return 0
+    fi
+    mkdir -p "${BTPANEL_INSTALL_DIR}/www_data" 2>/dev/null
+    if [ -d /www ]; then
+        mount --bind "${BTPANEL_INSTALL_DIR}/www_data" /www 2>/dev/null
+        if [ -w /www ]; then return 0; fi
+    fi
+    return 1
+}
+
+patch_install_script_for_data() {
+    local script="$1"
+    [ ! -f "$script" ] && return 1
+    sed -i 's|/www/server|/data/btpanel/server|g' "$script" 2>/dev/null
+    sed -i 's|/www/wwwroot|/data/btpanel/wwwroot|g' "$script" 2>/dev/null
+    sed -i 's|/www/backup|/data/btpanel/backup|g' "$script" 2>/dev/null
+    sed -i 's|/www/wwwlogs|/data/btpanel/wwwlogs|g' "$script" 2>/dev/null
+    sed -i 's|/usr/bin/bt|/data/btpanel/bt|g' "$script" 2>/dev/null
+    sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$script" 2>/dev/null
+    sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$script" 2>/dev/null
+    mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt 2>/dev/null
+    return 0
 }
 
 setup_default_credentials() {
@@ -182,15 +220,27 @@ auto_install_btpanel() {
             echo "[FATAL] 没有 curl 也没有 wget，无法联网下载"
             exit 1
         fi
-        mkdir -p /www; chmod 755 /www
+
+        # ===== 关键：处理 /www 只读问题 =====
+        if ensure_www_writable; then
+            echo "[OK] /www 可写，使用标准路径"
+        else
+            echo "[WARN] /www 不可写，将 patch 安装脚本使用 /data/btpanel"
+        fi
 
         echo "下载 install_panel.sh..."
-        local install_script="/tmp/bt_install_panel.sh"
+        local install_script="/data/local/tmp/bt_install_panel.sh"
         if ! download_file "https://download.bt.cn/install/install_panel.sh" "$install_script"; then
             echo "[FATAL] 下载安装脚本失败"
             exit 2
         fi
         chmod 0755 "$install_script"
+
+        # 如果 /www 不可写，patch 安装脚本使用 /data/btpanel
+        if ! ensure_www_writable; then
+            patch_install_script_for_data "$install_script"
+            echo "[OK] 安装脚本已 patch: /www → /data/btpanel, /usr/bin/bt → /data/btpanel/bt"
+        fi
 
         echo "执行安装（3-10 分钟）..."
         # 捕获 bash 安装子过程退出码

@@ -25,6 +25,7 @@ find_btpanel() {
     local paths="
         /www/server/panel/bt
         /data/btpanel/bt
+        /data/btpanel/server/panel/bt
         /data/adb/btpanel/bt
         /data/btpanel/panel/bt
         /data/linux/bt
@@ -65,6 +66,7 @@ is_btpanel_installed() {
     local bt_bin=$(find_btpanel)
     local core_ok=0
     if [ -d "/www/server/panel" ] && [ -f "/www/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
+    if [ -d "/data/btpanel/server/panel" ] && [ -f "/data/btpanel/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
     if [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ]; then core_ok=1; fi
     if [ -d "/data/adb/btpanel/panel" ] && [ -f "/data/adb/btpanel/panel/class/panelPlugin.py" ]; then core_ok=1; fi
     if [ -d "/data/linux/www/server/panel" ] && [ -f "/data/linux/www/server/panel/class/panelPlugin.py" ]; then core_ok=1; fi
@@ -358,9 +360,15 @@ install_panel() {
         echo -e "${RED}警告: 网络似乎不通，安装可能失败${NC}"
     fi
 
-    # 创建目录
+    # 创建目录（处理 /www 只读）
     mkdir -p "${BTPANEL_FLAG_DIR}"
-    mkdir -p /www
+    if ! mkdir -p /www 2>/dev/null; then
+        echo -e "${YELLOW}⚠ /www 不可写（根文件系统只读），将安装到 /data/btpanel${NC}"
+        mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt
+        USE_DATA_FALLBACK=1
+    else
+        USE_DATA_FALLBACK=0
+    fi
 
     # 日志轮转：超过 512KB 时只保留最后 1000 行
     if [ -f "$INSTALL_LOG" ]; then
@@ -372,13 +380,26 @@ install_panel() {
 
     # 下载安装脚本
     echo -e "${YELLOW}正在下载宝塔面板安装脚本...${NC}"
-    local install_script="/tmp/bt_install_panel.sh"
+    local install_script="/data/local/tmp/bt_install_panel.sh"
+    mkdir -p /data/local/tmp 2>/dev/null
     if ! download_file "https://download.bt.cn/install/install_panel.sh" "$install_script"; then
         echo -e "${RED}下载安装脚本失败${NC}"
         echo "请检查网络连接后重试"
         exit 1
     fi
     chmod 0755 "$install_script"
+
+    # 如果 /www 不可写，patch 安装脚本使用 /data/btpanel
+    if [ "$USE_DATA_FALLBACK" = "1" ]; then
+        sed -i 's|/www/server|/data/btpanel/server|g' "$install_script" 2>/dev/null
+        sed -i 's|/www/wwwroot|/data/btpanel/wwwroot|g' "$install_script" 2>/dev/null
+        sed -i 's|/www/backup|/data/btpanel/backup|g' "$install_script" 2>/dev/null
+        sed -i 's|/www/wwwlogs|/data/btpanel/wwwlogs|g' "$install_script" 2>/dev/null
+        sed -i 's|/usr/bin/bt|/data/btpanel/bt|g' "$install_script" 2>/dev/null
+        sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$install_script" 2>/dev/null
+        sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$install_script" 2>/dev/null
+        echo -e "${YELLOW}安装脚本已 patch: /www → /data/btpanel${NC}"
+    fi
 
     echo -e "${YELLOW}开始安装宝塔面板（此过程可能需要 3-10 分钟）...${NC}"
     echo -e "${YELLOW}安装日志: ${INSTALL_LOG}${NC}"

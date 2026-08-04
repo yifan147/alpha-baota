@@ -21,6 +21,7 @@ find_btpanel() {
     local paths="
         /www/server/panel/bt
         /data/btpanel/bt
+        /data/btpanel/server/panel/bt
         /data/adb/btpanel/bt
         /data/btpanel/panel/bt
         /data/linux/bt
@@ -50,7 +51,7 @@ is_btpanel_running() {
 is_btpanel_installed() {
     local bt_bin=$(find_btpanel)
     local core_ok=0
-    for d in /www/server/panel "${BTPANEL_INSTALL_DIR}/panel" /data/adb/btpanel/panel /data/linux/www/server/panel; do
+    for d in /www/server/panel /data/btpanel/server/panel "${BTPANEL_INSTALL_DIR}/panel" /data/adb/btpanel/panel /data/linux/www/server/panel; do
         if [ -d "$d" ] && [ -f "$d/class/panelPlugin.py" ]; then core_ok=1; break; fi
     done
     [ -n "$bt_bin" ] && [ $core_ok -eq 1 ] && return 0
