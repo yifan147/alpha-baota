@@ -70,8 +70,10 @@ safe_cleanup_on_disable() {
     for p in $(pgrep -f "service.sh.*btpanel" 2>/dev/null); do
         [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
-    # 未出生的 sleep
-    pkill -9 -f "sleep 300" >/dev/null 2>&1 || true
+    # 杀掉本模块启动的后台刷新循环（精确匹配 service.sh 路径，避免误杀系统 sleep）
+    for p in $(pgrep -f "service.sh" 2>/dev/null); do
+        [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
+    done
 
     log_crash "safe_cleanup 已杀掉后台后代进程 (kill_count=$kills)"
 
@@ -132,7 +134,7 @@ wait_for_network() {
         # 5. 关键：DNS 有配置时，做真实 DNS 解析测试（ping 域名）
         #    避免「net.dns1 有值但 DNS 实际未生效」的误判
         if [ $dns_ready -eq 1 ]; then
-            # ping 域名（会触发 DNS 解析）；-W 2 超时
+            # ping 域名（会触发 DNS 解析）；-W 3 超时
             if ping -c 1 -W 3 download.bt.cn >/dev/null 2>&1; then
                 return 0
             fi
@@ -146,6 +148,14 @@ wait_for_network() {
                      -o /dev/null "http://www.bt.cn" 2>/dev/null && return 0
             elif command -v wget >/dev/null 2>&1; then
                 wget -q --timeout=5 -O /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+            fi
+            # DNS 有配置但解析失败 → 尝试设置公共 DNS（每轮只设一次，避免刷屏）
+            if [ $elapsed -eq 0 ]; then
+                echo "[wait_for_network] DNS 解析失败，尝试设置公共 DNS 223.5.5.5..." 2>/dev/null
+                setprop net.dns1 223.5.5.5 2>/dev/null || true
+                setprop net.dns2 8.8.8.8 2>/dev/null || true
+                # 重新解析
+                ping -c 1 -W 3 download.bt.cn >/dev/null 2>&1 && return 0
             fi
         fi
         [ $elapsed -ge $timeout ] && return 1
@@ -265,8 +275,10 @@ patch_install_script_for_data() {
     sed -i 's|/usr/bin/bt|/data/btpanel/bt|g' "$script" 2>/dev/null
     sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$script" 2>/dev/null
     sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$script" 2>/dev/null
-    # /tmp → /data/local/tmp（Android 没有 /tmp）
-    sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
+    # /tmp → /data/local/tmp（仅当 /tmp 不可写时才替换，避免破坏可写 /tmp 的正常使用）
+    if [ ! -w /tmp ]; then
+        sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
+    fi
     mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt 2>/dev/null
     return 0
 }
@@ -647,10 +659,16 @@ auto_install_btpanel() {
             fi
         else
             echo "[FATAL] 安装失败（退出码 $rc），请查看上方日志"
+            # 关键：必须 exit 非零，否则 overall_rc=0 → 失败日志不创建
+            exit 1
         fi
     } >> "${INSTALL_LOG}" 2>&1
 
     local overall_rc=$?
+    # 即使 overall_rc=0（如 exit 0 被跳过），也检查实际安装状态
+    if ! is_btpanel_installed; then
+        overall_rc=1
+    fi
     if [ $overall_rc -ne 0 ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装流程异常，rc=$overall_rc" >> "$CRASH_LOG"
         cp -f "$INSTALL_LOG" "${BTPANEL_FLAG_DIR}/install.failed.log" 2>/dev/null || true

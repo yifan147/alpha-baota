@@ -164,8 +164,10 @@ patch_install_script_for_data() {
     sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$script" 2>/dev/null
     # /etc/init.d/bt → /data/btpanel/init.d/bt
     sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$script" 2>/dev/null
-    # /tmp → /data/local/tmp（Android 没有 /tmp）
-    sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
+    # /tmp → /data/local/tmp（仅当 /tmp 不可写时）
+    if [ ! -w /tmp ]; then
+        sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
+    fi
     # 创建 fallback 目录
     mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt 2>/dev/null
     return 0

@@ -357,11 +357,30 @@ echo "  [电源键]  = 退出操作菜单"
 echo "  60 秒无操作自动退出"
 echo ""
 
-# 未安装直接提示退出
+# 未安装时显示更友好的状态
 if ! is_btpanel_installed; then
+    # 检查是否正在安装中
+    if [ -f "$INSTALL_LOCK" ] || [ -f "$FORCE_CONTINUE_FLAG" ]; then
+        echo "  ↓ 宝塔面板正在安装中，请耐心等待..."
+        echo "    安装日志: $INSTALL_LOG"
+        echo "    安装完成后会自动启动面板服务"
+        sleep 6
+        exit 0
+    fi
+    # 检查是否有安装失败日志
+    if [ -f "$INSTALL_FAILED_LOG" ]; then
+        echo "  ✗ 宝塔面板安装失败"
+        echo "    失败日志: $INSTALL_FAILED_LOG"
+        echo "    安装日志: $INSTALL_LOG"
+        echo "    崩溃日志: $CRASH_LOG"
+        echo ""
+        echo "    可尝试：重启设备自动重试，或使用预构建包模式"
+        sleep 8
+        exit 0
+    fi
     echo "  ❌ 未检测到宝塔面板完整安装。"
     echo "     本模块会在刷入时自动尝试安装宝塔面板。"
-    echo "     若安装未完成，请联网后执行: btpanel install"
+    echo "     若安装未完成，请联网后重启设备自动重试"
     echo "     日志: $INSTALL_LOG"
     sleep 6
     exit 0

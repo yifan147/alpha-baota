@@ -1,7 +1,7 @@
 id=btpanel_iqoo7
 name=iQOO 7 宝塔面板自动安装+开机自启
-version=v2.5.1
-versionCode=10
+version=v2.5.2
+versionCode=11
 author=iQOO7_Modder
 description=iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块
 新增预构建打包模式：已装设备打包 btpanel_prebuilt_arm64.tar.gz → 新设备直接解压跳过安装（10秒完成）
