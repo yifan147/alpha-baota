@@ -70,8 +70,8 @@ safe_cleanup_on_disable() {
     for p in $(pgrep -f "service.sh.*btpanel" 2>/dev/null); do
         [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
-    # 杀掉本模块启动的后台刷新循环（精确匹配 service.sh 路径，避免误杀系统 sleep）
-    for p in $(pgrep -f "service.sh" 2>/dev/null); do
+    # 杀掉本模块启动的后台进程（只匹配 btpanel 相关，避免误杀其他模块的 service.sh）
+    for p in $(pgrep -f "btpanel.*service\.sh\|service\.sh.*btpanel" 2>/dev/null); do
         [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
 
@@ -617,9 +617,11 @@ auto_install_btpanel() {
             fi
         fi
 
-        # ===== 关键：处理 /www 只读问题 =====
+        # ===== 关键：处理 /www 只读问题（只调用一次，缓存结果）=====
+        local www_ok=0
         if ensure_www_writable; then
             echo "[OK] /www 可写，使用标准路径"
+            www_ok=1
         else
             echo "[WARN] /www 不可写，将 patch 安装脚本使用 /data/btpanel"
         fi
@@ -652,8 +654,8 @@ auto_install_btpanel() {
         fi
         chmod 0755 "$install_script"
 
-        # 如果 /www 不可写，patch 安装脚本使用 /data/btpanel
-        if ! ensure_www_writable; then
+        # 如果 /www 不可写，patch 安装脚本使用 /data/btpanel（用缓存结果，不再重复调用）
+        if [ $www_ok -eq 0 ]; then
             patch_install_script_for_data "$install_script"
             echo "[OK] 安装脚本已 patch: /www → /data/btpanel, /usr/bin/bt → /data/btpanel/bt"
         fi
@@ -901,8 +903,9 @@ if [ $need_force_continue -eq 1 ]; then
     is_module_disabled && safe_cleanup_on_disable
     if [ ! -f "$INSTALL_LOCK" ]; then
         # 后台执行安装，带重试逻辑（最多 3 次，间隔 30 秒）
+        # 注意：subshell 内不用 local（POSIX sh 中 local 只在函数内有效）
         (
-            local retry=0 max_retry=3
+            retry=0; max_retry=3
             while [ $retry -lt $max_retry ]; do
                 auto_install_btpanel
                 is_btpanel_installed && break
@@ -925,8 +928,9 @@ else
     is_module_disabled && safe_cleanup_on_disable
     if [ ! -f "$INSTALL_LOCK" ]; then
         # 安装放在后台，带重试逻辑（最多 3 次，间隔 30 秒）
+        # 注意：subshell 内不用 local（POSIX sh 中 local 只在函数内有效）
         (
-            local retry=0 max_retry=3
+            retry=0; max_retry=3
             while [ $retry -lt $max_retry ]; do
                 auto_install_btpanel
                 is_btpanel_installed && break

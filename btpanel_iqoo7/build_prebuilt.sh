@@ -83,7 +83,8 @@ for p in /www/server/panel/bt /data/btpanel/bt /data/btpanel/server/panel/bt /us
 done
 if [ -n "$BT_BIN" ]; then
     echo "  执行: $BT_BIN stop"
-    BT_IGNORE=1 "$BT_BIN" stop >/dev/null 2>&1 || true
+    export BT_IGNORE=1
+    "$BT_BIN" stop >/dev/null 2>&1 || true
     sleep 3
     pkill -9 -f "BT-Panel" >/dev/null 2>&1 || true
     pkill -9 -f "gunicorn.*panel" >/dev/null 2>&1 || true
@@ -180,7 +181,8 @@ fi
 if [ -n "$BT_BIN" ]; then
     echo ""
     echo "  正在重新启动宝塔面板..."
-    BT_IGNORE=1 nohup "$BT_BIN" start >/dev/null 2>&1 &
+    export BT_IGNORE=1
+    nohup "$BT_BIN" start >/dev/null 2>&1 &
 fi
 
 rm -f "$TMP_LIST"
