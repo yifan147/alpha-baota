@@ -66,12 +66,8 @@ safe_cleanup_on_disable() {
     for p in $(pgrep -P "$self_pid" 2>/dev/null); do
         [ -n "$p" ] && kill -9 "$p" 2>/dev/null
     done
-    # update_module_desc 或 btpanel/service.sh 后台进程名匹配
-    for p in $(pgrep -f "service.sh.*btpanel" 2>/dev/null); do
-        [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
-    done
-    # 杀掉本模块启动的后台进程（只匹配 btpanel 相关，避免误杀其他模块的 service.sh）
-    for p in $(pgrep -f "btpanel.*service\.sh\|service\.sh.*btpanel" 2>/dev/null); do
+    # 杀掉本模块启动的后台进程（用 ERE | 而非 BRE \|，匹配 btpanel 相关 service.sh）
+    for p in $(pgrep -f "btpanel_iqoo7/service.sh" 2>/dev/null); do
         [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
     done
 
@@ -85,9 +81,9 @@ safe_cleanup_on_disable() {
 is_module_disabled() {
     local md
     for md in $MODULE_PATHS; do
+        # skip_mount 只跳过 overlay 挂载，模块本身仍启用 → 不应视为禁用
         [ -f "$md/disable" ]    && return 0
         [ -f "$md/remove" ]     && return 0
-        [ -f "$md/skip_mount" ] && return 0
     done
     return 1
 }
@@ -398,6 +394,7 @@ setup_default_credentials() {
     [ -f "$userfile" ] || userfile="/data/btpanel/server/panel/data/userInfo.json"
     if [ -f "$userfile" ]; then
         sed -i 's|"username"[[:space:]]*:[[:space:]]*"[^"]*"|"username":"admin"|g' "$userfile" 2>/dev/null || true
+        chmod 0600 "$userfile" 2>/dev/null || true
     fi
     return 0
 }
@@ -442,8 +439,11 @@ unpack_prebuilt_tarball() {
     # 检查 tar 是否支持 -z；busybox tar 常不支持 z，要先 gzip 再 tar
     if tar -tzf "$tgz" >/dev/null 2>&1; then
         echo "[OK] tar 支持 gzip 解压（-z）"
-        echo "执行: tar -xpzf $tgz -C /"
-        tar -xpzf "$tgz" -C / >> "$INSTALL_LOG" 2>&1 || true
+        tar -xpzf "$tgz" -C / >> "$INSTALL_LOG" 2>&1
+        local tar_rc=$?
+        if [ $tar_rc -ne 0 ]; then
+            echo "[WARN] tar -xpzf 返回非零 ($tar_rc)，可能部分文件解包失败"
+        fi
     elif command -v gzip >/dev/null 2>&1; then
         echo "[OK] busybox tar 无 z，先 gzip -d 解再 tar xf"
         local ungz="/data/local/tmp/btpanel_prebuilt.tar"
@@ -458,9 +458,12 @@ unpack_prebuilt_tarball() {
             rm -f "$ungz"
             return 3
         fi
-        tar -xpf "$ungz" -C / >> "$INSTALL_LOG" 2>&1 || true
+        tar -xpf "$ungz" -C / >> "$INSTALL_LOG" 2>&1
         local rc=$?
         rm -f "$ungz"
+        if [ $rc -ne 0 ]; then
+            echo "[WARN] tar -xpf 返回非零 ($rc)，可能部分文件解包失败"
+        fi
         if is_btpanel_installed; then
             echo "[OK] gzip→tar 两步解包成功"
         else
@@ -480,10 +483,14 @@ unpack_prebuilt_tarball() {
 }
 
 _prebuilt_finish() {
-    # 权限修复：面板必须目录可写
+    # 权限修复：目录 0755，但敏感数据文件保持 0600
     chmod 0755 /www /data/btpanel 2>/dev/null || true
-    chmod -R 0755 /www/server 2>/dev/null || true
-    chmod -R 0755 /data/btpanel/server 2>/dev/null || true
+    # 只对目录设置 0755，不递归改文件权限（避免敏感文件泄露）
+    find /www/server -type d -exec chmod 0755 {} + 2>/dev/null || true
+    find /data/btpanel/server -type d -exec chmod 0755 {} + 2>/dev/null || true
+    # 可执行文件设置 0755
+    find /www/server -type f -name "*.sh" -exec chmod 0755 {} + 2>/dev/null || true
+    find /data/btpanel/server -type f -name "*.sh" -exec chmod 0755 {} + 2>/dev/null || true
     # bt 命令执行权限
     for bp in /www/server/panel/bt /data/btpanel/bt /data/btpanel/server/panel/bt /usr/bin/bt; do
         [ -f "$bp" ] && chmod 0755 "$bp" 2>/dev/null
@@ -578,7 +585,9 @@ auto_install_btpanel() {
         fi
     fi
 
-    {
+    # 关键：用子 shell ( ) 而非命令组 { }，这样 exit 只退出子 shell
+    # 不会杀死外层的重试循环，overall_rc 正确接收退出码
+    (
         echo "========== 自动安装开始 $(date '+%Y-%m-%d %H:%M:%S') =========="
         if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
             echo "[FATAL] 没有 curl 也没有 wget，无法联网下载"
@@ -684,7 +693,7 @@ auto_install_btpanel() {
             # 关键：必须 exit 非零，否则 overall_rc=0 → 失败日志不创建
             exit 1
         fi
-    } >> "${INSTALL_LOG}" 2>&1
+    ) >> "${INSTALL_LOG}" 2>&1
 
     local overall_rc=$?
     # 即使 overall_rc=0（如 exit 0 被跳过），也检查实际安装状态
@@ -825,8 +834,9 @@ update_module_desc() {
     for md in $MODULE_PATHS; do
         mp="$md/module.prop"
         [ -f "$mp" ] || continue
-        local descfile="${BTPANEL_FLAG_DIR}/.module_desc_content_$$"
-        local tmpfile="${BTPANEL_FLAG_DIR}/.module_newprop_$$"
+        # 关键：用 mktemp 替代 $$ 避免多子 shell 并发时 PID 碰撞
+        local descfile=$(mktemp "${BTPANEL_FLAG_DIR}/.module_desc_XXXXXX" 2>/dev/null || echo "${BTPANEL_FLAG_DIR}/.module_desc_$$_$RANDOM")
+        local tmpfile=$(mktemp "${BTPANEL_FLAG_DIR}/.module_newprop_XXXXXX" 2>/dev/null || echo "${BTPANEL_FLAG_DIR}/.module_newprop_$$_$RANDOM")
         mkdir -p "$BTPANEL_FLAG_DIR" 2>/dev/null || true
 
         # 写 description 正文（保留 $new_desc 里的换行）

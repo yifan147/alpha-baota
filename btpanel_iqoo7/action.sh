@@ -102,8 +102,9 @@ update_visible_desc() {
     for md in $MODULE_DIRS; do
         local mp="$md/module.prop"
         [ -f "$mp" ] || continue
-        local descfile="${BTPANEL_FLAG_DIR}/.action_desc_$$"
-        local tmpfile="${BTPANEL_FLAG_DIR}/.action_newprop_$$"
+        # 用 mktemp 替代 $$ 避免并发竞态
+        local descfile=$(mktemp "${BTPANEL_FLAG_DIR}/.action_desc_XXXXXX" 2>/dev/null || echo "${BTPANEL_FLAG_DIR}/.action_desc_$$_$RANDOM")
+        local tmpfile=$(mktemp "${BTPANEL_FLAG_DIR}/.action_newprop_XXXXXX" 2>/dev/null || echo "${BTPANEL_FLAG_DIR}/.action_newprop_$$_$RANDOM")
         printf '%s' "$desc" > "$descfile" 2>/dev/null
 
         # 100% 精准方案：只保留合法 key=value 行（key 不是 description），再追加新 description
@@ -280,13 +281,18 @@ read_key() {
             code=""
             rc=1
         fi
-        # keycheck 某些实现用退出码代替 stdout
-        [ -z "$code" ] && [ "$rc" != "124" ] && code=$rc
-        case "$code" in
-            115|113|1|UP|up)          echo "UP";    return 0 ;;
-            114|116|2|DOWN|down)      echo "DOWN";  return 0 ;;
-            4|0|PWR|power|POWER)      echo "POWER"; return 0 ;;
-        esac
+        # 关键修复：keycheck 异常退出码（1/2/4）不应误判为按键
+        # 只接受 keycheck 的 stdout 输出（UP/DOWN/POWER/数字字符串）
+        # 不接受把退出码当作按键的回退逻辑
+        if [ -n "$code" ]; then
+            case "$code" in
+                115|113|UP|up)          echo "UP";    return 0 ;;
+                114|116|DOWN|down)      echo "DOWN";  return 0 ;;
+                4|PWR|power|POWER)      echo "POWER"; return 0 ;;
+                # 0 和 1/2 退出码不再当作按键 — 太容易误触发
+            esac
+        fi
+        # keycheck 无输出或输出不匹配 → 继续走 getevent 方法
     fi
 
     # ===== 方法 2：getevent 原始事件（最通用）=====

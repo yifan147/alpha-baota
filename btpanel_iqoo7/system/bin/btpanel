@@ -177,13 +177,16 @@ setup_default_credentials() {
         local hashed_pw
         hashed_pw=$(perl -e 'print crypt("admin", "42xY1BTm")' 2>/dev/null || echo "42x72Dm6gN1Ww")
         echo "$hashed_pw" > "$pl" 2>/dev/null || true
+        chmod 0600 "$pl" 2>/dev/null || true
     elif [ -f "$pl" ]; then
         echo "42x72Dm6gN1Ww" > "$pl" 2>/dev/null || true
+        chmod 0600 "$pl" 2>/dev/null || true
     fi
     local userfile="/www/server/panel/data/userInfo.json"
     [ -f "$userfile" ] || userfile="/data/btpanel/server/panel/data/userInfo.json"
     if [ -f "$userfile" ]; then
         sed -i 's|"username"[[:space:]]*:[[:space:]]*"[^"]*"|"username":"admin"|g' "$userfile" 2>/dev/null || true
+        chmod 0600 "$userfile" 2>/dev/null || true
     fi
     echo -e "${GREEN}默认账号: admin  默认密码: admin${NC}"
 }
@@ -383,7 +386,9 @@ install_panel() {
 
     # 检查是否已有 install.sh 进程在运行（避免两个安装进程冲突）
     if [ -f "${INSTALL_LOCK}" ]; then
-        local lockpid=$(cat "${INSTALL_LOCK}" 2>/dev/null)
+        # service.sh 写入格式为 "PID timestamp"，btpanel 写入格式为 "PID"
+        # 统一用 awk 只取第一个字段（PID）
+        local lockpid=$(awk '{print $1}' "${INSTALL_LOCK}" 2>/dev/null)
         if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then
             echo -e "${YELLOW}⚠ 检测到已在运行的安装进程 (PID: $lockpid)${NC}"
             echo "  请等待安装完成，或使用: btpanel log 查看进度"
@@ -542,7 +547,11 @@ install_panel() {
         echo -n "."
         if [ $elapsed -ge $timeout ]; then
             echo ""
-            echo -e "${RED}安装超时，请检查日志: btpanel log${NC}"
+            echo -e "${RED}安装超时（${timeout}秒），终止后台安装进程...${NC}"
+            # 关键：超时后必须杀掉后台安装进程，否则孤儿进程继续运行 + INSTALL_LOCK 残留
+            kill -9 "$install_pid" 2>/dev/null
+            pkill -9 -f "bt_install_panel.sh" 2>/dev/null || true
+            pkill -9 -f "install_panel.sh" 2>/dev/null || true
             break
         fi
     done

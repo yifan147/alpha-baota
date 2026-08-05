@@ -61,13 +61,15 @@ for dir in \
     /data/btpanel/wwwroot \
     /data/btpanel/bt \
     /data/btpanel/init.d; do
-    if [ -d "$dir" ] || [ -f "$dir" ]; then
+    if [ -d "$dir" ] || [ -f "$dir" ] || [ -L "$dir" ]; then
         echo "$dir" >> "$TMP_LIST"
         echo "  + $dir"
     fi
 done
-for f in /usr/bin/bt /etc/init.d/bt; do
-    if [ -f "$f" ]; then
+# 系统级配置和 init 脚本
+for f in /usr/bin/bt /etc/init.d/bt /etc/init.d/nginx /etc/init.d/mysqld \
+         /etc/init.d/httpd /etc/my.cnf /root/.my.cnf /root/.bt.cnf; do
+    if [ -f "$f" ] || [ -L "$f" ]; then
         echo "$f" >> "$TMP_LIST"
         echo "  + $f"
     fi
@@ -143,9 +145,13 @@ DURATION=$((END_T - START_T))
 echo "[6/6] 校验输出文件..."
 if [ -f "$OUT_TGZ" ] && [ -s "$OUT_TGZ" ]; then
     SIZE_BYTES=$(wc -c < "$OUT_TGZ")
+    # 确保 SIZE_BYTES 是有效数字
+    case "$SIZE_BYTES" in
+        ''|*[!0-9]*) SIZE_BYTES=0 ;;
+    esac
     SIZE_MB=$((SIZE_BYTES / 1048576))
     # 额外校验：tarball 至少 100MB，否则算失败
-    if [ "$SIZE_BYTES" -lt 104857600 ] 2>/dev/null; then
+    if [ "$SIZE_BYTES" -lt 104857600 ]; then
         echo "  ❌ 打包异常：文件过小（${SIZE_MB} MB < 100MB），内容不全"
         echo "  检查 tar log: /data/local/tmp/bt_prebuilt_tar.log"
         [ -f "$TAR_LOG" ] && tail -n 30 "$TAR_LOG"
