@@ -12,11 +12,14 @@ BTPANEL_FLAG_DIR="${BTPANEL_INSTALL_DIR}/.module_flags"
 BTPANEL_STATE_FILE="${BTPANEL_FLAG_DIR}/state"
 INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
 CRASH_LOG="${BTPANEL_INSTALL_DIR}/crash.log"
-MODULE_DIR="/data/adb/modules/btpanel_iqoo7"
+INSTALL_FAILED_LOG="${BTPANEL_FLAG_DIR}/install.failed.log"
+FORCE_CONTINUE_FLAG="${BTPANEL_FLAG_DIR}/force_continue_install"
+INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
+MODULE_DIRS="/data/adb/modules/btpanel_iqoo7 /data/adb/modules_update/btpanel_iqoo7 /data/alcatel/modules/btpanel_iqoo7 /data/local/tmp/magisk_btpanel_iqoo7"
 
 mkdir -p "${BTPANEL_FLAG_DIR}" 2>/dev/null || true
 
-# ===== 共享函数（与 service.sh / btpanel 语义一致，保持独立不互调）=====
+# 共享函数（与 service.sh / btpanel 语义一致，保持独立不互调）
 find_btpanel() {
     local paths="
         /www/server/panel/bt
@@ -74,26 +77,62 @@ log_crash() {
 
 # 更新模块介绍（Alpha/Delta/Magisk 标准路径都覆盖）
 update_visible_desc() {
-    # 兼容 Magisk / Alpha Magisk (3400) / Magisk Delta 三个路径
-    for md in "$MODULE_DIR" \
-              "/data/adb/modules_update/btpanel_iqoo7" \
-              "/data/alcatel/modules/btpanel_iqoo7" \
-              "/data/local/tmp/magisk_btpanel_iqoo7"; do
-        local mp="$md/module.prop"
-        [ -f "$mp" ] || continue
-        local ip=$(get_lan_ip)
-        local status="" icon=""
-        if is_btpanel_running; then
-            status="已启动"; icon="▶"
-        else
-            status="已关闭"; icon="■"
-        fi
-        local desc="iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块
+    local ip=$(get_lan_ip)
+    local status="" icon=""
+    # 状态优先级（与 service.sh 对齐）：安装中 ↓ > 安装失败 ✗ > 已启动 ▶ > 已关闭 ■
+    if [ -f "$INSTALL_LOCK" ] || [ -f "$FORCE_CONTINUE_FLAG" ]; then
+        status="安装中 ↓"; icon="↓"
+    elif ! is_btpanel_installed && [ -f "$INSTALL_FAILED_LOG" ]; then
+        status="安装失败 ✗"; icon="✗"
+    elif is_btpanel_running; then
+        status="已启动"; icon="▶"
+    elif is_btpanel_installed || [ -f "${BTPANEL_FLAG_DIR}/installed" ]; then
+        status="已关闭"; icon="■"
+    else
+        status="安装中 ↓"; icon="↓"
+    fi
+
+    local desc="iQOO 7 专属宝塔面板自动安装+开机自启 Magisk 模块
 首次安装自动检测宝塔：已装跳过/残留清理/未装联网安装
-状态: $icon $status  |  访问: http://${ip}:8888
+状态: $icon $status
+访问地址: http://${ip}:8888
 默认账号: admin  密码: admin
 操作: 点右下按钮  [音量上 = 开启]  [音量下 = 关闭]"
-        sed -i "/^description=/c\description=$desc" "$mp" 2>/dev/null || true
+
+    for md in $MODULE_DIRS; do
+        local mp="$md/module.prop"
+        [ -f "$mp" ] || continue
+        local descfile="${BTPANEL_FLAG_DIR}/.action_desc_$$"
+        local tmpfile="${BTPANEL_FLAG_DIR}/.action_newprop_$$"
+        printf '%s' "$desc" > "$descfile" 2>/dev/null
+
+        # 100% 精准方案：只保留合法 key=value 行（key 不是 description），再追加新 description
+        rm -f "$tmpfile"
+        grep -E '^(id|name|version|versionCode|author)=' "$mp" > "$tmpfile" 2>/dev/null || true
+        if [ ! -s "$tmpfile" ]; then
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$mp" | grep -v '^description=' > "$tmpfile" 2>/dev/null || true
+            [ ! -s "$tmpfile" ] && cat "$mp" > "$tmpfile" 2>/dev/null
+        fi
+        if [ -f "$descfile" ]; then
+            local first=1 dline
+            while IFS= read -r dline || [ -n "$dline" ]; do
+                if [ $first -eq 1 ]; then
+                    printf 'description=%s\n' "$dline" >> "$tmpfile" 2>/dev/null
+                    first=0
+                else
+                    printf '%s\n' "$dline" >> "$tmpfile" 2>/dev/null
+                fi
+            done < "$descfile"
+            if [ $first -eq 1 ]; then
+                printf 'description=btpanel_iqoo7\n' >> "$tmpfile" 2>/dev/null
+            fi
+        fi
+
+        if [ -s "$tmpfile" ]; then
+            mv "$tmpfile" "$mp" 2>/dev/null || true
+            chmod 0644 "$mp" 2>/dev/null || true
+        fi
+        rm -f "$tmpfile" "$descfile" 2>/dev/null || true
     done
 }
 

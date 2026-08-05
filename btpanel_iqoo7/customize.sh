@@ -162,8 +162,27 @@ setup_default_credentials() {
     sleep 3
     local bt_bin=$(find_btpanel)
     [ -z "$bt_bin" ] && return 1
-    echo "admin" | "$bt_bin" 5 >/dev/null 2>&1
-    echo "admin" | "$bt_bin" 6 >/dev/null 2>&1
+    # 三层兜底：菜单 bt 5/6 管道 → default.pl 写 crypt 哈希 → userInfo.json sed
+    (
+        printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 5 >/dev/null 2>&1
+        sleep 2
+        printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 6 >/dev/null 2>&1
+    ) &
+    sleep 5
+    local pl="/www/server/panel/data/default.pl"
+    [ -f "$pl" ] || pl="/data/btpanel/server/panel/data/default.pl"
+    if command -v perl >/dev/null 2>&1 && [ -f "$pl" ]; then
+        local hashed_pw
+        hashed_pw=$(perl -e 'print crypt("admin", "42xY1BTm")' 2>/dev/null || echo "42x72Dm6gN1Ww")
+        echo "$hashed_pw" > "$pl" 2>/dev/null || true
+    elif [ -f "$pl" ]; then
+        echo "42x72Dm6gN1Ww" > "$pl" 2>/dev/null || true
+    fi
+    local userfile="/www/server/panel/data/userInfo.json"
+    [ -f "$userfile" ] || userfile="/data/btpanel/server/panel/data/userInfo.json"
+    if [ -f "$userfile" ]; then
+        sed -i 's|"username"[[:space:]]*:[[:space:]]*"[^"]*"|"username":"admin"|g' "$userfile" 2>/dev/null || true
+    fi
     return 0
 }
 

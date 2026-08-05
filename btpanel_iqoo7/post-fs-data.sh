@@ -7,8 +7,10 @@
 
 BTPANEL_DATA_DIR="/data/btpanel"
 BTPANEL_WWW_DATA="${BTPANEL_DATA_DIR}/www_data"
+BTPANEL_FLAG_DIR="${BTPANEL_DATA_DIR}/.module_flags"
 
 mkdir -p "$BTPANEL_WWW_DATA" 2>/dev/null
+mkdir -p "$BTPANEL_FLAG_DIR" 2>/dev/null
 
 # 方法 1：直接创建 /www（部分设备 rootfs 可写）
 mkdir -p /www 2>/dev/null

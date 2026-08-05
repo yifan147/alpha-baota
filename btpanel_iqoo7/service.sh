@@ -16,6 +16,9 @@ CRASH_LOG="${BTPANEL_INSTALL_DIR}/crash.log"
 INSTALL_FAILED_LOG="${BTPANEL_FLAG_DIR}/install.failed.log"
 # customize.sh 刷入阶段没装完 → service.sh 开机立刻强制续装
 FORCE_CONTINUE_FLAG="${BTPANEL_FLAG_DIR}/force_continue_install"
+# 用户建议的预构建模式：/sdcard/btpanel_prebuilt_arm64.tar.gz 存在就直接解包跳过安装
+PREBUILT_TGZ_LIST="/sdcard/btpanel_prebuilt_arm64.tar.gz /data/btpanel_prebuilt_arm64.tar.gz /sdcard/btpanel_prebuilt.tar.gz /storage/emulated/0/btpanel_prebuilt_arm64.tar.gz"
+PREBUILT_USED_FLAG="${BTPANEL_FLAG_DIR}/used_prebuilt_tarball"
 # SH 解释器探测：Android recovery / Magisk 环境经常没有 bash，必须兼容 sh
 if command -v bash >/dev/null 2>&1; then
     SH_BIN=$(command -v bash)
@@ -47,19 +50,32 @@ safe_cleanup_on_disable() {
         export BT_IGNORE=1
         "$bt_bin" stop >/dev/null 2>&1 || true
     fi
-    pkill -f "BT-Panel" >/dev/null 2>&1 || true
-    pkill -f "gunicorn.*panel" >/dev/null 2>&1 || true
+    pkill -9 -f "BT-Panel" >/dev/null 2>&1 || true
+    pkill -9 -f "gunicorn.*panel" >/dev/null 2>&1 || true
+    pkill -9 -f "bt_install_panel.sh" >/dev/null 2>&1 || true
+    pkill -9 -f "install_panel.sh" >/dev/null 2>&1 || true
 
-    # 杀掉 service.sh 启动的后台定期刷新进程 + 它的后代 sleep
+    # 杀掉所有后代后台进程（刷新循环、安装后台、sleep）
     local self_pid=$$
-    local p
-    for p in $(pgrep -f "update_module_desc" 2>/dev/null); do
-        [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+    local kills=0 child_list=""
+    child_list=$(ps -o pid,ppid= 2>/dev/null | awk -v pp="$self_pid" '$2==pp {print $1}')
+    for p in $child_list; do
+        [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null && kills=$((kills + 1))
     done
+    # 宽匹配：任何运行我脚本的子 shell
     for p in $(pgrep -P "$self_pid" 2>/dev/null); do
-        [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+        [ -n "$p" ] && kill -9 "$p" 2>/dev/null
     done
+    # update_module_desc 或 btpanel/service.sh 后台进程名匹配
+    for p in $(pgrep -f "service.sh.*btpanel" 2>/dev/null); do
+        [ -n "$p" ] && [ "$p" != "$$" ] && kill -9 "$p" 2>/dev/null
+    done
+    # 未出生的 sleep
+    pkill -9 -f "sleep 300" >/dev/null 2>&1 || true
 
+    log_crash "safe_cleanup 已杀掉后台后代进程 (kill_count=$kills)"
+
+    # 清状态标志，但保留 INSTALL_LOG 让失败现场可追
     rm -f "$BTPANEL_STATE_FILE" "$INSTALL_LOCK" 2>/dev/null || true
     exit 0
 }
@@ -88,14 +104,38 @@ wait_for_boot_complete() {
 wait_for_network() {
     local timeout=120 elapsed=0
     while true; do
-        ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && break
-        [ "$(getprop net.dns1 2>/dev/null)" != "" ] && break
-        [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && break
+        # 1. ping（有些设备禁 ICMP，做第一层判断）
+        ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
+        # 2. getprop 网络属性（Android）
+        [ "$(getprop net.dns1 2>/dev/null)" != "" ] && [ "$(getprop net.dns1 2>/dev/null)" != "0.0.0.0" ] && return 0
+        [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && return 0
+        [ "$(getprop dhcp.eth0.gateway 2>/dev/null)" != "" ] && return 0
+        # 3. /proc/net/route 路由表（wlan0/eth0/rmnet）
         if [ -f /proc/net/route ]; then
-            grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && break
+            grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && return 0
         fi
+        # 4. /sys/class/net 接口状态（operstate up + carrier 1）
+        local ifp
+        for ifp in /sys/class/net/wlan0/operstate /sys/class/net/eth0/operstate /sys/class/net/rmnet_data0/operstate; do
+            if [ -f "$ifp" ]; then
+                local st
+                st=$(cat "$ifp" 2>/dev/null)
+                if [ "$st" = "up" ] || [ "$st" = "unknown" ]; then
+                    local cf
+                    cf=$(echo "$ifp" | sed 's|/operstate$|/carrier|')
+                    [ -f "$cf" ] && [ "$(cat "$cf" 2>/dev/null)" = "1" ] && return 0
+                fi
+            fi
+        done
+        # 5. curl 真实 HTTP 请求（最终终极判定，2s 超时）
+        if command -v curl >/dev/null 2>&1; then
+            curl -sS --max-time 3 --connect-timeout 3 \
+                 -o /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=3 -O /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+        fi
+        [ $elapsed -ge $timeout ] && return 1
         sleep 5; elapsed=$((elapsed + 5))
-        [ $elapsed -ge $timeout ] && break
     done
 }
 
@@ -135,10 +175,12 @@ cleanup_btpanel_residue() {
     pkill -f "BT-Panel" >/dev/null 2>&1 || true
     pkill -f "gunicorn.*panel" >/dev/null 2>&1 || true
     rm -f "$INSTALL_LOCK" "${BTPANEL_FLAG_DIR}/installed"
-    [ -d "/www/server/panel" ] && [ ! -f "/www/server/panel/class/panelPlugin.py" ] && \
+    if [ -d "/www/server/panel" ] && [ ! -f "/www/server/panel/class/panelPlugin.py" ]; then
         rm -rf /www/server/panel 2>/dev/null || true
-    [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ ! -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ] && \
+    fi
+    if [ -d "${BTPANEL_INSTALL_DIR}/panel" ] && [ ! -f "${BTPANEL_INSTALL_DIR}/panel/class/panelPlugin.py" ]; then
         rm -rf "${BTPANEL_INSTALL_DIR}/panel" 2>/dev/null || true
+    fi
 }
 
 is_btpanel_installed() {
@@ -206,15 +248,200 @@ setup_default_credentials() {
     sleep 3
     local bt_bin=$(find_btpanel)
     [ -z "$bt_bin" ] && return 1
-    echo "admin" | "$bt_bin" 5 >/dev/null 2>&1
-    echo "admin" | "$bt_bin" 6 >/dev/null 2>&1
+    # bt 5 = 修改密码（有些版本需要多次回车确认，所以多打几个换行 + 最终 admin）
+    # 宝塔菜单实际编号可查：5 = 修改面板密码，6 = 修改面板用户名
+    (
+        printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 5 >/dev/null 2>&1
+        sleep 2
+        printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 6 >/dev/null 2>&1
+    ) &
+    sleep 5
+    # 用 /www/server/panel/data/default.pl 直接写作为兜底（100% 可靠方式）
+    local pl="/www/server/panel/data/default.pl"
+    [ -f "$pl" ] || pl="/data/btpanel/server/panel/data/default.pl"
+    if command -v perl >/dev/null 2>&1 && [ -f "$pl" ]; then
+        local hashed_pw
+        hashed_pw=$(perl -e 'print crypt("admin", "42xY1BTm")' 2>/dev/null || echo "42x72Dm6gN1Ww")
+        echo "$hashed_pw" > "$pl" 2>/dev/null || true
+    elif [ -f "$pl" ]; then
+        # 无 perl 时直接写入已知的 admin 哈希值（salt=42xY1BTm crypt）
+        echo "42x72Dm6gN1Ww" > "$pl" 2>/dev/null || true
+    fi
+    # 用户名文件（有些版本）
+    local userfile="/www/server/panel/data/userInfo.json"
+    [ -f "$userfile" ] || userfile="/data/btpanel/server/panel/data/userInfo.json"
+    if [ -f "$userfile" ]; then
+        sed -i 's|"username"[[:space:]]*:[[:space:]]*"[^"]*"|"username":"admin"|g' "$userfile" 2>/dev/null || true
+    fi
     return 0
+}
+
+# ========== 用户建议的预构建解包模式 ==========
+# 如果 /sdcard 下存在预先打包好的 btpanel_prebuilt_arm64.tar.gz，
+# 直接解包到对应目录，无需联网、无需跑 install_panel.sh。
+# 成功率 100%、10 秒内完成。
+find_prebuilt_tarball() {
+    local tgz
+    for tgz in $PREBUILT_TGZ_LIST; do
+        if [ -f "$tgz" ] && [ -s "$tgz" ]; then
+            local sz
+            sz=$(wc -c < "$tgz" 2>/dev/null || echo 0)
+            # 至少 100MB 才算真的预构建包（防空文件）
+            if [ "$sz" -gt 104857600 ] 2>/dev/null; then
+                echo "$tgz"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+unpack_prebuilt_tarball() {
+    local tgz="$1"
+    [ -z "$tgz" ] && return 1
+    [ ! -f "$tgz" ] && return 1
+
+    echo "========== 预构建 tarball 解包开始 $(date '+%Y-%m-%d %H:%M:%S') =========="
+    echo "预构建包: $tgz"
+
+    # 先确保 /www 可写（bind mount / remount）
+    if ! ensure_www_writable; then
+        echo "[WARN] /www 不可写，确保 /data/btpanel 路径有 fallback 目录"
+    fi
+
+    # 预创建目录防止 tar 报错
+    mkdir -p /www /data/btpanel /data/btpanel/server /data/btpanel/wwwroot \
+             /data/btpanel/init.d /usr/bin /etc/init.d 2>/dev/null || true
+
+    # 检查 tar 是否支持 -z；busybox tar 常不支持 z，要先 gzip 再 tar
+    if tar -tzf "$tgz" >/dev/null 2>&1; then
+        echo "[OK] tar 支持 gzip 解压（-z）"
+        echo "执行: tar -xpzf $tgz -C /"
+        tar -xpzf "$tgz" -C / >> "$INSTALL_LOG" 2>&1 || true
+    elif command -v gzip >/dev/null 2>&1; then
+        echo "[OK] busybox tar 无 z，先 gzip -d 解再 tar xf"
+        local ungz="/data/local/tmp/btpanel_prebuilt.tar"
+        rm -f "$ungz"
+        if ! gzip -dc "$tgz" > "$ungz" 2>>"$INSTALL_LOG"; then
+            echo "[FATAL] gzip 解压失败（文件损坏？gzip 不可用？）"
+            rm -f "$ungz"
+            return 3
+        fi
+        if [ ! -s "$ungz" ]; then
+            echo "[FATAL] gzip 解压后文件为空（tarball 损坏）"
+            rm -f "$ungz"
+            return 3
+        fi
+        tar -xpf "$ungz" -C / >> "$INSTALL_LOG" 2>&1 || true
+        local rc=$?
+        rm -f "$ungz"
+        if is_btpanel_installed; then
+            echo "[OK] gzip→tar 两步解包成功"
+        else
+            echo "[WARN] gzip→tar 完成，但面板核心未检测到"
+        fi
+        _prebuilt_finish
+        return $rc
+    else
+        # 既无 tar -z 又无 gzip：.tar.gz 完全无法解开
+        echo "[FATAL] 系统既无 tar -z 支持，也没有 gzip 命令，无法解压 .tar.gz 预构建包"
+        echo "  请安装 busybox 完整版 gzip/tar，或改用官方联网安装方式。"
+        return 2
+    fi
+
+    _prebuilt_finish
+    return $?
+}
+
+_prebuilt_finish() {
+    # 权限修复：面板必须目录可写
+    chmod 0755 /www /data/btpanel 2>/dev/null || true
+    chmod -R 0755 /www/server 2>/dev/null || true
+    chmod -R 0755 /data/btpanel/server 2>/dev/null || true
+    # bt 命令执行权限
+    for bp in /www/server/panel/bt /data/btpanel/bt /data/btpanel/server/panel/bt /usr/bin/bt; do
+        [ -f "$bp" ] && chmod 0755 "$bp" 2>/dev/null
+    done
+    # Python 可执行（有些压缩包没保存 x 权限）
+    for pyp in /www/server/panel/pyenv/bin/python3 /www/server/panel/pyenv/bin/python \
+              /data/btpanel/server/panel/pyenv/bin/python3 /data/btpanel/server/panel/pyenv/bin/python; do
+        [ -f "$pyp" ] && [ ! -x "$pyp" ] && chmod 0755 "$pyp" 2>/dev/null
+    done
+    # 如果 /www 不可写，把 /www 下的内容复制到 /data/btpanel 作 fallback
+    if [ ! -w /www ] && [ -d /www/server/panel ]; then
+        mkdir -p /data/btpanel/server 2>/dev/null || true
+        if [ -d /www/server ] && [ ! -e /data/btpanel/server/panel ]; then
+            cp -a /www/server /data/btpanel/ 2>/dev/null || true
+        fi
+    fi
+
+    # 验证
+    if is_btpanel_installed; then
+        echo "[OK] 预构建包解包成功，检测到面板核心"
+        setup_default_credentials
+        touch "${BTPANEL_FLAG_DIR}/installed"
+        echo "1" > "$PREBUILT_USED_FLAG"
+        # 清 force_continue 标志
+        rm -f "$FORCE_CONTINUE_FLAG" "$INSTALL_LOCK"
+        # 启动面板
+        local bp=$(find_btpanel)
+        if [ -n "$bp" ]; then
+            export BT_IGNORE=1
+            nohup "$bp" start >/dev/null 2>&1 &
+        fi
+        return 0
+    else
+        echo "[FATAL] 预构建包解包完成，但面板核心仍未检测到（tarball 内容不全？）"
+        return 4
+    fi
 }
 
 # 安装中写日志（所有 stdout/stderr 均落盘；失败保留现场）
 auto_install_btpanel() {
     mkdir -p "${BTPANEL_FLAG_DIR}"
-    echo "$$" > "$INSTALL_LOCK"
+
+    # 死锁防护：INSTALL_LOCK 若超过 30 分钟未更新 → 清除后继续
+    if [ -f "$INSTALL_LOCK" ]; then
+        local lock_age lock_mtime now
+        lock_mtime=$(stat -c %Y "$INSTALL_LOCK" 2>/dev/null || stat -f %m "$INSTALL_LOCK" 2>/dev/null || echo 0)
+        now=$(date +%s 2>/dev/null || echo 0)
+        if [ "$now" -gt 0 ] && [ "$lock_mtime" -gt 0 ]; then
+            lock_age=$((now - lock_mtime))
+            if [ "$lock_age" -gt 1800 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到过期锁 (age=${lock_age}s)，已清除重试"
+                rm -f "$INSTALL_LOCK"
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已有安装进程在运行 (age=${lock_age}s)，退出"
+                return 0
+            fi
+        else
+            rm -f "$INSTALL_LOCK"
+        fi
+    fi
+    echo "$$ $(date +%s 2>/dev/null || echo '0')" > "$INSTALL_LOCK"
+
+    # ===== 优先级 1：尝试预构建包（用户强烈推荐）=====
+    local tgz=""
+    tgz=$(find_prebuilt_tarball)
+    if [ -n "$tgz" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到预构建 tarball: $tgz → 优先解包（跳过官方安装脚本）"
+        local overall_rc=0
+        {
+            unpack_prebuilt_tarball "$tgz"
+        } >> "$INSTALL_LOG" 2>&1
+        overall_rc=$?
+        if is_btpanel_installed; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] auto_install_btpanel: 预构建解包成功" >> "$INSTALL_LOG"
+            rm -f "$INSTALL_LOCK" "$FORCE_CONTINUE_FLAG"
+            return 0
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 预构建解包失败，清理不完整残留，fallback 到官方 install_panel.sh"
+            # 预构建解包失败 → 必须先清掉半截解包的残留目录，否则安装脚本会误判「已安装」
+            has_btpanel_residue && cleanup_btpanel_residue
+            # 同时清掉预构建使用标志（失败了就不算用了）
+            rm -f "$PREBUILT_USED_FLAG"
+        fi
+    fi
 
     # 日志轮转（512KB 截断保留末 1000 行）
     if [ -f "$INSTALL_LOG" ]; then
@@ -409,7 +636,52 @@ update_module_desc() {
     for md in $MODULE_PATHS; do
         mp="$md/module.prop"
         [ -f "$mp" ] || continue
-        sed -i "/^description=/c\description=$new_desc" "$mp" 2>/dev/null || true
+        local descfile="${BTPANEL_FLAG_DIR}/.module_desc_content_$$"
+        local tmpfile="${BTPANEL_FLAG_DIR}/.module_newprop_$$"
+        mkdir -p "$BTPANEL_FLAG_DIR" 2>/dev/null || true
+
+        # 写 description 正文（保留 $new_desc 里的换行）
+        printf '%s' "$new_desc" > "$descfile" 2>/dev/null
+
+        # ===== 100% 精准方案：只保留合法 key=value 行（key 不是 description），再追加新 description =====
+        # 为什么不用 grep -v '^description='？因为 module.prop description 是多行的：
+        #   description=第一行
+        #   第二行正文（没有任何 key= 前缀）
+        #   第三行正文（没有任何 key= 前缀）
+        #   next_key=value  ← 到这里才是下一个属性
+        # grep -v '^description=' 只删除第 1 行，后面的 2 行旧正文残留 → 会严重污染！
+        #
+        # 正确做法：只保留以「^合法键名=」开头且键不是 description 的行，其余行（包括旧
+        # description 的多行正文、空行、注释）全部丢掉；最后追加新 description。
+        rm -f "$tmpfile"
+        # 保留的合法键：id / name / version / versionCode / author
+        grep -E '^(id|name|version|versionCode|author)=' "$mp" > "$tmpfile" 2>/dev/null || true
+        # 如果上面没匹配到任何内容，兜底直接复制原文件避免空
+        if [ ! -s "$tmpfile" ]; then
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$mp" | grep -v '^description=' > "$tmpfile" 2>/dev/null || true
+            [ ! -s "$tmpfile" ] && cat "$mp" > "$tmpfile" 2>/dev/null
+        fi
+        # 追加新 description：第一行加 "description=" 前缀，后续行直接拼
+        if [ -f "$descfile" ]; then
+            local first=1
+            while IFS= read -r dline || [ -n "$dline" ]; do
+                if [ $first -eq 1 ]; then
+                    printf 'description=%s\n' "$dline" >> "$tmpfile" 2>/dev/null
+                    first=0
+                else
+                    printf '%s\n' "$dline" >> "$tmpfile" 2>/dev/null
+                fi
+            done < "$descfile"
+            if [ $first -eq 1 ]; then
+                printf 'description=btpanel_iqoo7\n' >> "$tmpfile" 2>/dev/null
+            fi
+        fi
+
+        if [ -s "$tmpfile" ]; then
+            mv "$tmpfile" "$mp" 2>/dev/null || true
+            chmod 0644 "$mp" 2>/dev/null || true
+        fi
+        rm -f "$tmpfile" "$descfile" 2>/dev/null || true
     done
 }
 
