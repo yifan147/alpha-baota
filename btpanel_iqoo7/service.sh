@@ -104,17 +104,19 @@ wait_for_boot_complete() {
 wait_for_network() {
     local timeout=120 elapsed=0
     while true; do
-        # 1. ping（有些设备禁 ICMP，做第一层判断）
+        # 1. ping IP（有些设备禁 ICMP，做第一层判断）
         ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
-        # 2. getprop 网络属性（Android）
-        [ "$(getprop net.dns1 2>/dev/null)" != "" ] && [ "$(getprop net.dns1 2>/dev/null)" != "0.0.0.0" ] && return 0
-        [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && return 0
-        [ "$(getprop dhcp.eth0.gateway 2>/dev/null)" != "" ] && return 0
-        # 3. /proc/net/route 路由表（wlan0/eth0/rmnet）
+        # 2. getprop 网络属性（Android）— 但这只是"有DNS配置"，不代表DNS能解析！
+        #    放宽为：只作为"网络可能就绪"的信号，不直接 return 0
+        local dns_ready=0
+        [ "$(getprop net.dns1 2>/dev/null)" != "" ] && [ "$(getprop net.dns1 2>/dev/null)" != "0.0.0.0" ] && dns_ready=1
+        [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && dns_ready=1
+        [ "$(getprop dhcp.eth0.gateway 2>/dev/null)" != "" ] && dns_ready=1
+        # 3. /proc/net/route 路由表
         if [ -f /proc/net/route ]; then
-            grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && return 0
+            grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && dns_ready=1
         fi
-        # 4. /sys/class/net 接口状态（operstate up + carrier 1）
+        # 4. /sys/class/net 接口状态
         local ifp
         for ifp in /sys/class/net/wlan0/operstate /sys/class/net/eth0/operstate /sys/class/net/rmnet_data0/operstate; do
             if [ -f "$ifp" ]; then
@@ -123,16 +125,28 @@ wait_for_network() {
                 if [ "$st" = "up" ] || [ "$st" = "unknown" ]; then
                     local cf
                     cf=$(echo "$ifp" | sed 's|/operstate$|/carrier|')
-                    [ -f "$cf" ] && [ "$(cat "$cf" 2>/dev/null)" = "1" ] && return 0
+                    [ -f "$cf" ] && [ "$(cat "$cf" 2>/dev/null)" = "1" ] && dns_ready=1
                 fi
             fi
         done
-        # 5. curl 真实 HTTP 请求（最终终极判定，2s 超时）
-        if command -v curl >/dev/null 2>&1; then
-            curl -sS --max-time 3 --connect-timeout 3 \
-                 -o /dev/null "http://www.bt.cn" 2>/dev/null && return 0
-        elif command -v wget >/dev/null 2>&1; then
-            wget -q --timeout=3 -O /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+        # 5. 关键：DNS 有配置时，做真实 DNS 解析测试（ping 域名）
+        #    避免「net.dns1 有值但 DNS 实际未生效」的误判
+        if [ $dns_ready -eq 1 ]; then
+            # ping 域名（会触发 DNS 解析）；-W 2 超时
+            if ping -c 1 -W 3 download.bt.cn >/dev/null 2>&1; then
+                return 0
+            fi
+            # getent / nslookup 兜底
+            if command -v getent >/dev/null 2>&1; then
+                getent hosts download.bt.cn >/dev/null 2>&1 && return 0
+            fi
+            # curl HTTP 请求最终判定（需要 DNS 解析 www.bt.cn）
+            if command -v curl >/dev/null 2>&1; then
+                curl -sS --max-time 5 --connect-timeout 5 \
+                     -o /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+            elif command -v wget >/dev/null 2>&1; then
+                wget -q --timeout=5 -O /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+            fi
         fi
         [ $elapsed -ge $timeout ] && return 1
         sleep 5; elapsed=$((elapsed + 5))
@@ -201,13 +215,24 @@ download_file() {
     local out_dir
     out_dir=$(dirname "$out" 2>/dev/null)
     [ -n "$out_dir" ] && mkdir -p "$out_dir" 2>/dev/null
+    # 关键：先删除旧文件，防止下载失败后执行上次的残留脚本
+    rm -f "$out" 2>/dev/null
+    local rc=1
     if command -v curl >/dev/null 2>&1; then
-        curl -sSLo "$out" "$url" --connect-timeout 30 --retry 3
+        curl -sSLo "$out" "$url" --connect-timeout 30 --retry 3 2>&1
+        rc=$?
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$out" "$url" --timeout=30 --tries=3
+        wget -qO "$out" "$url" --timeout=30 --tries=3 2>&1
+        rc=$?
     else
         return 1
     fi
+    # 验证：下载失败或文件为空 → 清除并返回错误
+    if [ $rc -ne 0 ] || [ ! -s "$out" ]; then
+        rm -f "$out" 2>/dev/null
+        return 1
+    fi
+    return 0
 }
 
 # ========== /www 只读文件系统兼容 ==========
@@ -240,7 +265,76 @@ patch_install_script_for_data() {
     sed -i 's|/usr/bin/bt|/data/btpanel/bt|g' "$script" 2>/dev/null
     sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$script" 2>/dev/null
     sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$script" 2>/dev/null
+    # /tmp → /data/local/tmp（Android 没有 /tmp）
+    sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
     mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt 2>/dev/null
+    return 0
+}
+
+# ========== Android 环境兼容：执行安装脚本前准备 ==========
+# 官方 install_panel.sh 假设 Linux 环境，需要做以下适配：
+# 1. /tmp 目录（tee/log 写入）→ 创建或用 /data/local/tmp
+# 2. HOME 变量（cd ~ 展开）→ 设置为 /data/btpanel
+# 3. /etc/hostname /etc/issue /etc/redhat-release（只读）→ 创建 dummy 或 patch 脚本
+prepare_android_env() {
+    # 1. 创建 /tmp（如果根文件系统可写）
+    mkdir -p /tmp 2>/dev/null
+    if [ ! -d /tmp ] || [ ! -w /tmp ]; then
+        # /tmp 不存在或不可写 → bind mount 或 symlink
+        mkdir -p /data/local/tmp 2>/dev/null
+        # 尝试创建 /tmp 并 bind mount
+        mkdir -p /tmp 2>/dev/null
+        mount -o bind /data/local/tmp /tmp 2>/dev/null || true
+    fi
+    # 验证 /tmp 可写
+    if [ ! -w /tmp ]; then
+        # 最后兜底：创建一个 tmpfs
+        mkdir -p /tmp 2>/dev/null
+        mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+    fi
+
+    # 2. 设置 HOME（cd ~ 需要）
+    export HOME="${HOME:-/data/btpanel}"
+    [ -d "$HOME" ] || mkdir -p "$HOME" 2>/dev/null
+
+    # 3. /etc/hostname /etc/issue /etc/redhat-release
+    #    官方安装脚本读这些做 OS 检测，Android 没有但只读 → 创建 dummy
+    #    先尝试在 /etc/ 下创建，失败则 patch 安装脚本跳过
+    local etc_writable=0
+    if [ -d /etc ]; then
+        touch /etc/.bt_write_test 2>/dev/null && rm -f /etc/.bt_write_test && etc_writable=1
+    fi
+    if [ $etc_writable -eq 1 ]; then
+        [ ! -f /etc/hostname ] && echo "android" > /etc/hostname 2>/dev/null || true
+        [ ! -f /etc/issue ] && echo "Android" > /etc/issue 2>/dev/null || true
+        [ ! -f /etc/redhat-release ] && echo "CentOS Linux release 7.0 (Core)" > /etc/redhat-release 2>/dev/null || true
+    fi
+    # 如果 /etc 不可写，后续 patch_install_script_for_android 会处理
+
+    return 0
+}
+
+# patch 安装脚本中不兼容 Android 的部分（/etc/hostname 写入、OS检测等）
+patch_install_script_for_android() {
+    local script="$1"
+    [ ! -f "$script" ] && return 1
+
+    # /tmp → /data/local/tmp（如果 /tmp 不可写）
+    if [ ! -w /tmp ]; then
+        sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
+    fi
+
+    # /etc/hostname 写入 → 重定向到 /data/btpanel/hostname（Android /etc 只读）
+    if [ ! -w /etc ]; then
+        sed -i 's|/etc/hostname|/data/btpanel/hostname|g' "$script" 2>/dev/null
+        sed -i 's|/etc/issue|/data/btpanel/issue|g' "$script" 2>/dev/null
+        sed -i 's|/etc/redhat-release|/data/btpanel/redhat-release|g' "$script" 2>/dev/null
+        # 创建 dummy 文件
+        echo "android" > /data/btpanel/hostname 2>/dev/null || true
+        echo "Android" > /data/btpanel/issue 2>/dev/null || true
+        echo "CentOS Linux release 7.0 (Core)" > /data/btpanel/redhat-release 2>/dev/null || true
+    fi
+
     return 0
 }
 
@@ -459,6 +553,38 @@ auto_install_btpanel() {
             exit 1
         fi
 
+        # ===== 关键：检查 bash 是否可用 =====
+        # 官方 install_panel.sh 使用 bash 语法（数组、((expr)) 等），
+        # 如果系统只有 sh/ash（busybox），执行必然报 syntax error
+        if [ -z "$SH_BIN" ] || [ ! -x "$SH_BIN" ]; then
+            echo "[FATAL] 找不到可用的 shell 解释器（需要 bash）"
+            echo "  Android busybox sh 无法执行 install_panel.sh 的 bash 语法"
+            exit 1
+        fi
+        # 检查是否真的是 bash（不是 sh/ash）
+        local is_bash=0
+        "$SH_BIN" -c '[[ 1 == 1 ]]' >/dev/null 2>&1 && is_bash=1
+        if [ $is_bash -eq 0 ]; then
+            echo "[WARN] SH_BIN=$SH_BIN 不是 bash，install_panel.sh 可能语法报错"
+            echo "  尝试查找系统中的 bash..."
+            local found_bash=""
+            for bp in /system/bin/bash /system/xbin/bash /data/adb/magisk/busybox/bash \
+                      /data/adb/magisk/.magisk/busybox/bash /sbin/bash /usr/bin/bash; do
+                if [ -x "$bp" ]; then
+                    found_bash="$bp"
+                    break
+                fi
+            done
+            if [ -n "$found_bash" ]; then
+                SH_BIN="$found_bash"
+                echo "  [OK] 找到 bash: $SH_BIN"
+            else
+                echo "[FATAL] 系统没有 bash，无法执行官方安装脚本"
+                echo "  解决方案：1) 使用预构建包模式 2) 安装 busybox 完整版含 bash"
+                exit 1
+            fi
+        fi
+
         # ===== 关键：处理 /www 只读问题 =====
         if ensure_www_writable; then
             echo "[OK] /www 可写，使用标准路径"
@@ -466,10 +592,30 @@ auto_install_btpanel() {
             echo "[WARN] /www 不可写，将 patch 安装脚本使用 /data/btpanel"
         fi
 
+        # ===== 关键：准备 Android 环境（/tmp、HOME、/etc/）=====
+        prepare_android_env
+        echo "[OK] Android 环境准备完成 (HOME=$HOME, /tmp=$( [ -w /tmp ] && echo 'writable' || echo 'NOWRITE' ))"
+
         echo "下载 install_panel.sh..."
         local install_script="/data/local/tmp/bt_install_panel.sh"
         if ! download_file "https://download.bt.cn/install/install_panel.sh" "$install_script"; then
-            echo "[FATAL] 下载安装脚本失败"
+            echo "[FATAL] 下载安装脚本失败（DNS 解析失败？网络未就绪？）"
+            echo "  检查：ping download.bt.cn 是否能解析"
+            exit 2
+        fi
+        # 验证下载的脚本是有效的（非空 + 至少 1000 字节 + 首行是 #!）
+        local script_size
+        script_size=$(wc -c < "$install_script" 2>/dev/null || echo 0)
+        if [ "$script_size" -lt 1000 ] 2>/dev/null; then
+            echo "[FATAL] 下载的安装脚本异常：文件大小 ${script_size} 字节（期望 >1000）"
+            rm -f "$install_script"
+            exit 2
+        fi
+        local first_line
+        first_line=$(head -n 1 "$install_script" 2>/dev/null)
+        if ! echo "$first_line" | grep -q '^#!'; then
+            echo "[FATAL] 下载的安装脚本首行不是 shebang：$first_line"
+            rm -f "$install_script"
             exit 2
         fi
         chmod 0755 "$install_script"
@@ -479,10 +625,13 @@ auto_install_btpanel() {
             patch_install_script_for_data "$install_script"
             echo "[OK] 安装脚本已 patch: /www → /data/btpanel, /usr/bin/bt → /data/btpanel/bt"
         fi
+        # 无论如何都做 Android 兼容 patch（/tmp、/etc/hostname 等）
+        patch_install_script_for_android "$install_script"
 
         echo "执行安装（3-10 分钟）..."
-        # 注意：本块已经 { ... } >> "$INSTALL_LOG" 2>&1 重定向，不需要 tee
-        # 用 SH_BIN（可能是 bash 也可能是 sh）执行脚本，不用 PIPESTATUS
+        echo "  使用解释器: $SH_BIN"
+        echo "  HOME=$HOME  /tmp=$( [ -w /tmp ] && echo 'OK' || echo 'FAIL' )"
+        # 用 bash 执行脚本（install_panel.sh 使用 bash 语法）
         echo "y" | "$SH_BIN" "$install_script" ed8484bec
         local rc=$?
         echo "安装脚本退出码: $rc"

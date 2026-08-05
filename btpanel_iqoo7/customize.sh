@@ -95,13 +95,24 @@ download_file() {
     local out_dir
     out_dir=$(dirname "$out" 2>/dev/null)
     [ -n "$out_dir" ] && mkdir -p "$out_dir" 2>/dev/null
+    # 关键：先删除旧文件，防止下载失败后执行上次的残留脚本
+    rm -f "$out" 2>/dev/null
+    local rc=1
     if command -v curl >/dev/null 2>&1; then
-        curl -sSLo "$out" "$url" --connect-timeout 30 --retry 2
+        curl -sSLo "$out" "$url" --connect-timeout 30 --retry 3 2>&1
+        rc=$?
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$out" "$url" --timeout=30 --tries=2
+        wget -qO "$out" "$url" --timeout=30 --tries=3 2>&1
+        rc=$?
     else
         return 1
     fi
+    # 验证：下载失败或文件为空 → 清除并返回错误
+    if [ $rc -ne 0 ] || [ ! -s "$out" ]; then
+        rm -f "$out" 2>/dev/null
+        return 1
+    fi
+    return 0
 }
 
 # ========== /www 只读文件系统兼容 ==========
@@ -153,6 +164,8 @@ patch_install_script_for_data() {
     sed -i 's|/usr/bin/python|/data/btpanel/server/python/bin/python|g' "$script" 2>/dev/null
     # /etc/init.d/bt → /data/btpanel/init.d/bt
     sed -i 's|/etc/init.d/bt|/data/btpanel/init.d/bt|g' "$script" 2>/dev/null
+    # /tmp → /data/local/tmp（Android 没有 /tmp）
+    sed -i 's|/tmp/|/data/local/tmp/|g' "$script" 2>/dev/null
     # 创建 fallback 目录
     mkdir -p /data/btpanel/server /data/btpanel/wwwroot /data/btpanel/bt 2>/dev/null
     return 0
