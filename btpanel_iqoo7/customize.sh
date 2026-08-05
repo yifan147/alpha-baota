@@ -22,6 +22,8 @@ INSTALL_LOG="${BTPANEL_INSTALL_DIR}/install.log"
 CRASH_LOG="${BTPANEL_INSTALL_DIR}/crash.log"
 # "刷入阶段没装完" 标志：service.sh 看到就会强制立即续装
 FORCE_CONTINUE_FLAG="${BTPANEL_FLAG_DIR}/force_continue_install"
+INSTALL_LOCK="${BTPANEL_FLAG_DIR}/install.lock"
+INSTALL_FAILED_LOG="${BTPANEL_FLAG_DIR}/install.failed.log"
 
 mkdir -p "${BTPANEL_FLAG_DIR}" 2>/dev/null || true
 
@@ -81,10 +83,25 @@ cleanup_btpanel_residue() {
 }
 
 network_ok() {
+    # 1. ping IP（最直接）
     ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && return 0
-    [ "$(getprop net.dns1 2>/dev/null)" != "" ] && return 0
+    # 2. getprop 网络属性（但 net.dns1 有值 ≠ DNS 能解析，需要进一步验证）
+    local dns_ready=0
+    [ "$(getprop net.dns1 2>/dev/null)" != "" ] && [ "$(getprop net.dns1 2>/dev/null)" != "0.0.0.0" ] && dns_ready=1
+    [ "$(getprop dhcp.wlan0.gateway 2>/dev/null)" != "" ] && dns_ready=1
+    [ "$(getprop dhcp.eth0.gateway 2>/dev/null)" != "" ] && dns_ready=1
+    # 3. /proc/net/route
     if [ -f /proc/net/route ]; then
-        grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && return 0
+        grep -q '^wlan0\|^eth0\|^rmnet' /proc/net/route 2>/dev/null && dns_ready=1
+    fi
+    # 4. DNS 有配置时做真实 DNS 解析测试
+    if [ $dns_ready -eq 1 ]; then
+        ping -c 1 -W 3 download.bt.cn >/dev/null 2>&1 && return 0
+        if command -v curl >/dev/null 2>&1; then
+            curl -sS --max-time 5 --connect-timeout 5 -o /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=5 -O /dev/null "http://www.bt.cn" 2>/dev/null && return 0
+        fi
     fi
     return 1
 }
@@ -129,21 +146,27 @@ ensure_www_writable() {
         rm -f /www/.write_test
         return 0
     fi
-    # 方法 2：remount / 为 rw
-    mount -o remount,rw / 2>/dev/null
-    mkdir -p /www 2>/dev/null
-    # 不 remount 回 ro，保持 rw 让后续安装能写
-    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
-        rm -f /www/.write_test
-        return 0
-    fi
-    # 方法 3：bind mount /data 到 /www（如果 /www 存在）
+    # 方法 2：bind mount /data 到 /www（最安全，不改根文件系统）
     mkdir -p "${BTPANEL_INSTALL_DIR}/www_data" 2>/dev/null
     if [ -d /www ]; then
         mount --bind "${BTPANEL_INSTALL_DIR}/www_data" /www 2>/dev/null
         if [ -w /www ]; then
             return 0
         fi
+    else
+        mkdir -p /www 2>/dev/null
+        mount --bind "${BTPANEL_INSTALL_DIR}/www_data" /www 2>/dev/null
+        if [ -w /www ]; then
+            return 0
+        fi
+    fi
+    # 方法 3（最后手段）：remount / 为 rw
+    mount -o remount,rw / 2>/dev/null
+    mkdir -p /www 2>/dev/null
+    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
+        rm -f /www/.write_test
+        touch "${BTPANEL_FLAG_DIR}/.need_remount_ro" 2>/dev/null
+        return 0
     fi
     # 全部失败 → fallback
     return 1
@@ -183,7 +206,13 @@ setup_default_credentials() {
         sleep 2
         printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 6 >/dev/null 2>&1
     ) &
-    sleep 5
+    local cred_pid=$!
+    # 等待最多 15 秒让 bt 5/6 完成（超时不阻塞主流程）
+    local waited=0
+    while [ $waited -lt 15 ]; do
+        kill -0 "$cred_pid" 2>/dev/null || break
+        sleep 1; waited=$((waited + 1))
+    done
     local pl="/www/server/panel/data/default.pl"
     [ -f "$pl" ] || pl="/data/btpanel/server/panel/data/default.pl"
     if command -v perl >/dev/null 2>&1 && [ -f "$pl" ]; then

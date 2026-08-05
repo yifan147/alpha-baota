@@ -305,8 +305,13 @@ read_key() {
             # 无 timeout 命令，15s 短时间尝试
             local waited=0
             while [ $waited -lt $timeout_sec ]; do
-                raw_line=$(getevent -lc 1 "$evdev" 2>/dev/null &
-                    local pid=$!; sleep 1; kill $pid 2>/dev/null; wait 2>/dev/null)
+                # getevent 后台执行 1 秒后 kill，避免 wait 阻塞
+                getevent -lc 1 "$evdev" > /data/local/tmp/.bt_getevent_tmp 2>/dev/null &
+                local pid=$!
+                sleep 1
+                kill -9 "$pid" 2>/dev/null
+                raw_line=$(cat /data/local/tmp/.bt_getevent_tmp 2>/dev/null)
+                rm -f /data/local/tmp/.bt_getevent_tmp 2>/dev/null
                 if echo "$raw_line" | grep -q "KEY_VOLUMEUP"; then echo "UP"; return 0; fi
                 if echo "$raw_line" | grep -q "KEY_VOLUMEDOWN"; then echo "DOWN"; return 0; fi
                 if echo "$raw_line" | grep -q "KEY_POWER"; then echo "POWER"; return 0; fi

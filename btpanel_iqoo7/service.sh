@@ -247,20 +247,32 @@ download_file() {
 
 # ========== /www 只读文件系统兼容 ==========
 ensure_www_writable() {
+    # 如果 post-fs-data.sh 已经 bind mount 成功
     if [ -d /www ] && [ -w /www ]; then return 0; fi
+    # 方法 1：直接创建
     mkdir -p /www 2>/dev/null
     if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
         rm -f /www/.write_test; return 0
     fi
-    mount -o remount,rw / 2>/dev/null
-    mkdir -p /www 2>/dev/null
-    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
-        rm -f /www/.write_test; return 0
-    fi
+    # 方法 2：bind mount /data 到 /www（最安全，不改根文件系统）
     mkdir -p "${BTPANEL_INSTALL_DIR}/www_data" 2>/dev/null
     if [ -d /www ]; then
         mount --bind "${BTPANEL_INSTALL_DIR}/www_data" /www 2>/dev/null
         if [ -w /www ]; then return 0; fi
+    else
+        # /www 不存在 → 创建并 bind mount
+        mkdir -p /www 2>/dev/null
+        mount --bind "${BTPANEL_INSTALL_DIR}/www_data" /www 2>/dev/null
+        if [ -w /www ]; then return 0; fi
+    fi
+    # 方法 3（最后手段）：remount / 为 rw（有风险，但安装必须可写）
+    mount -o remount,rw / 2>/dev/null
+    mkdir -p /www 2>/dev/null
+    if [ -d /www ] && touch /www/.write_test 2>/dev/null; then
+        rm -f /www/.write_test
+        # 标记需要恢复 ro（安装完成后恢复）
+        touch "${BTPANEL_FLAG_DIR}/.need_remount_ro" 2>/dev/null
+        return 0
     fi
     return 1
 }
@@ -361,7 +373,15 @@ setup_default_credentials() {
         sleep 2
         printf 'admin\nadmin\nadmin\n\n\nadmin\nadmin\n' | "$bt_bin" 6 >/dev/null 2>&1
     ) &
-    sleep 5
+    local cred_pid=$!
+    # 等待最多 15 秒让 bt 5/6 完成（超时不阻塞主流程）
+    local waited=0
+    while [ $waited -lt 15 ]; do
+        kill -0 "$cred_pid" 2>/dev/null || break
+        sleep 1; waited=$((waited + 1))
+    done
+    # 如果还在跑就让它后台继续，不阻塞
+    kill -0 "$cred_pid" 2>/dev/null && log_crash "setup_default_credentials: bt 5/6 仍在执行(${waited}s)，后台继续" || true
     # 用 /www/server/panel/data/default.pl 直接写作为兜底（100% 可靠方式）
     local pl="/www/server/panel/data/default.pl"
     [ -f "$pl" ] || pl="/data/btpanel/server/panel/data/default.pl"
@@ -880,7 +900,19 @@ if [ $need_force_continue -eq 1 ]; then
     wait_for_network
     is_module_disabled && safe_cleanup_on_disable
     if [ ! -f "$INSTALL_LOCK" ]; then
-        ( auto_install_btpanel ) &
+        # 后台执行安装，带重试逻辑（最多 3 次，间隔 30 秒）
+        (
+            local retry=0 max_retry=3
+            while [ $retry -lt $max_retry ]; do
+                auto_install_btpanel
+                is_btpanel_installed && break
+                retry=$((retry + 1))
+                if [ $retry -lt $max_retry ]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装失败，第 ${retry} 次重试（共 ${max_retry} 次），30 秒后重试..." >> "$INSTALL_LOG" 2>/dev/null
+                    sleep 30
+                fi
+            done
+        ) &
     fi
 elif is_btpanel_installed; then
     mkdir -p "${BTPANEL_FLAG_DIR}"
@@ -892,8 +924,19 @@ else
     wait_for_network
     is_module_disabled && safe_cleanup_on_disable
     if [ ! -f "$INSTALL_LOCK" ]; then
-        # 安装放在后台，避免阻塞后续开机流程；安装日志全部落盘 + 失败写 crash
-        ( auto_install_btpanel ) &
+        # 安装放在后台，带重试逻辑（最多 3 次，间隔 30 秒）
+        (
+            local retry=0 max_retry=3
+            while [ $retry -lt $max_retry ]; do
+                auto_install_btpanel
+                is_btpanel_installed && break
+                retry=$((retry + 1))
+                if [ $retry -lt $max_retry ]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 安装失败，第 ${retry} 次重试（共 ${max_retry} 次），30 秒后重试..." >> "$INSTALL_LOG" 2>/dev/null
+                    sleep 30
+                fi
+            done
+        ) &
     fi
 fi
 
